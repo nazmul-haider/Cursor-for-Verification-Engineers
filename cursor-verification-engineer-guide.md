@@ -109,6 +109,921 @@ flowchart TB
 
 ---
 
+# Part 0: Elaborated Worked Examples
+
+The examples below use one reference project — an **APB-attached SPI master (`apb_spi_master`)**. Software configures the block through **APB CSRs**; the DUT drives an **SPI bus** (`sclk`, `mosi`, `miso`, `cs_n`) to a loopback or SPI slave BFM. Every artifact type (rule, command, skill, agent) is shown against the same DUT.
+
+```
+  CPU / testbench                DUT                    SPI world
+  ───────────────                ───                    ─────────
+  APB writes CSRs  ──APB──►  apb_spi_master  ──SPI──►  spi_slave_bfm
+  (CTRL, TX_DATA)              (shift engine)          (or MOSI-MISO loopback)
+```
+
+### Reference Project Layout
+
+```
+apb_spi_verif/
+├── rtl/                              # DUT — read-only for verification
+│   └── apb_spi_master.sv
+├── spec/
+│   └── APB_SPI_Master_Spec_v2.0.pdf
+├── tb/
+│   ├── interfaces/
+│   │   ├── apb_if.sv                 # CSR programming port
+│   │   └── spi_if.sv                 # DUT SPI pins
+│   ├── agents/
+│   │   ├── apb/                      # Programs registers
+│   │   │   ├── apb_agent.sv
+│   │   │   ├── apb_driver.sv
+│   │   │   └── apb_monitor.sv
+│   │   └── spi/                      # Monitors / drives SPI bus (BFM)
+│   │       ├── spi_agent.sv
+│   │       ├── spi_driver.sv
+│   │       └── spi_monitor.sv
+│   ├── reg_model/
+│   │   └── apb_spi_reg_block.sv
+│   ├── env/
+│   │   └── apb_spi_env.sv
+│   ├── sequences/
+│   │   ├── apb_base_seq.sv
+│   │   ├── apb_slverr_inj_seq.sv
+│   │   ├── spi_mode0_8b_seq.sv
+│   │   ├── spi_cpol_cpha_sweep_seq.sv
+│   │   └── csr_reset_check_seq.sv
+│   ├── tests/
+│   │   ├── apb_spi_base_test.sv
+│   │   ├── csr_reset_test.sv
+│   │   ├── csr_rw_test.sv
+│   │   └── spi_loopback_test.sv
+│   ├── coverage/
+│   │   ├── apb_trans_cg.sv
+│   │   └── spi_xfer_cg.sv
+│   ├── scoreboard/
+│   │   └── spi_scoreboard.sv
+│   └── top/
+│       └── tb_top.sv
+├── tests/
+│   └── regression.list
+└── .cursor/
+    ├── rules/ ...
+    ├── commands/ ...
+    ├── agents/ ...
+    └── skills/ ...
+```
+
+---
+
+## 0.1 Reading the Specification (SpecReader)
+
+### Spec Excerpt — APB Register Map (§4.2)
+
+| Offset | Register   | Field        | Bits   | Access | Reset | Description |
+|--------|------------|--------------|--------|--------|-------|-------------|
+| 0x00   | CTRL_REG   | enable       | [0]    | RW     | 0x0   | SPI block enable. 1 = operational |
+| 0x00   | CTRL_REG   | cpol         | [1]    | RW     | 0x0   | Clock polarity (SPI mode bit) |
+| 0x00   | CTRL_REG   | cpha         | [2]    | RW     | 0x0   | Clock phase (SPI mode bit) → Mode 0 default |
+| 0x00   | CTRL_REG   | master_en    | [3]    | RW     | 0x1   | 1 = master mode (reset enabled per spec) |
+| 0x00   | CTRL_REG   | clk_div      | [11:4] | RW     | 0x4   | SCLK divider from pclk (default ÷8) |
+| 0x00   | CTRL_REG   | reserved     | [31:12]| RSVD   | 0x0   | Read 0, write 0 |
+| 0x04   | STATUS_REG | busy         | [0]    | RO     | 0x0   | 1 while shift engine active |
+| 0x04   | STATUS_REG | tx_empty     | [1]    | RO     | 0x1   | TX FIFO empty (reset empty) |
+| 0x04   | STATUS_REG | rx_valid     | [2]    | RO     | 0x0   | RX FIFO has unread byte |
+| 0x04   | STATUS_REG | mode_fault   | [3]    | RO     | 0x0   | Multi-master / CS conflict detected |
+| 0x08   | TX_DATA    | tx_byte      | [7:0]  | WO     | —     | Write pushes byte to TX FIFO |
+| 0x0C   | RX_DATA    | rx_byte      | [7:0]  | RO     | —     | Read pops byte from RX FIFO |
+| 0x10   | XFER_LEN   | byte_count   | [7:0]  | RW     | 0x0   | Bytes per transaction (1–64) |
+| 0x14   | CS_CTRL    | cs_n         | [0]    | RW     | 0x1   | Chip select (active low), default deasserted |
+| 0x18   | INT_EN     | done_ie      | [0]    | RW     | 0x0   | Interrupt when transfer completes |
+| 0x18   | INT_EN     | rx_ie        | [1]    | RW     | 0x0   | Interrupt when RX FIFO non-empty |
+| 0x1C   | INT_STAT   | done         | [0]    | W1C    | 0x0   | Sticky transfer-done flag |
+| 0x1C   | INT_STAT   | rx_avail     | [1]    | W1C    | 0x0   | Sticky RX-available flag |
+
+### Spec Excerpt — SPI Protocol (§5.x)
+
+| Req ID | Spec Ref | Requirement (verbatim) | Test Scenario | Priority |
+|--------|----------|------------------------|---------------|----------|
+| REQ-APB01 | §3.1 | "The CSR interface shall comply with APB4." | `apb_protocol_sanity_test` | HIGH |
+| REQ-APB02 | §3.4 | "Back-to-back APB writes without idle shall be supported when PREADY is high." | `apb_back2back_wr_seq` | HIGH |
+| REQ-APB03 | §3.6 | "PSLVERR shall be asserted for unmapped CSR addresses." | `apb_slverr_inj_seq` | HIGH |
+| REQ-CSR01 | §4.2 | "CTRL_REG.enable shall be 0 after reset." | `csr_reset_test` | HIGH |
+| REQ-CSR02 | §4.2 | "STATUS_REG.busy shall be RO." | `csr_rw_test` | HIGH |
+| REQ-CSR03 | §4.2 | "INT_STAT.done shall clear on write-1-to-clear." | `csr_w1c_test` | HIGH |
+| REQ-SPI01 | §5.1 | "Data shall be transmitted MSB first on MOSI." | `spi_msb_first_check` | HIGH |
+| REQ-SPI02 | §5.2 | "CS_n shall be asserted before the first SCLK edge and deasserted after the last." | `spi_cs_timing_test` | HIGH |
+| REQ-SPI03 | §5.3 | "All four SPI modes (CPOL/CPHA combinations) shall be supported." | `spi_cpol_cpha_sweep_seq` | HIGH |
+| REQ-SPI04 | §5.4 | "When XFER_LEN.byte_count is 0, the block shall not start a transfer and shall set STATUS.mode_fault." | `spi_zero_len_test` | HIGH |
+| REQ-SPI05 | §5.5 | "In loopback, received bit on MISO shall match transmitted bit on MOSI for each SCLK cycle." | `spi_loopback_test` | HIGH |
+
+### Open Questions Flagged by SpecReader
+
+1. **§4.2 CTRL_REG.master_en reset = 1** — Master enabled at reset; confirm whether SPI pins tri-state until `enable` is set.
+2. **§5.3 Mode 3 at clk_div = 1** — Minimum divider for timing closure not stated; need max SCLK from spec Table 5.1.
+3. **§5.4 byte_count = 0** — Should `mode_fault` latch until W1C, or auto-clear when `byte_count` reprogrammed?
+
+---
+
+## 0.2 Complete CSR Register Model
+
+Full `uvm_reg` block for the APB SPI master CSR map:
+
+```systemverilog
+// tb/reg_model/apb_spi_reg_block.sv
+class spi_ctrl_reg extends uvm_reg;
+  rand uvm_reg_field enable;
+  rand uvm_reg_field cpol;
+  rand uvm_reg_field cpha;
+  rand uvm_reg_field master_en;
+  rand uvm_reg_field clk_div;
+  rand uvm_reg_field reserved;
+
+  `uvm_object_utils(spi_ctrl_reg)
+
+  virtual function void build();
+    enable    = uvm_reg_field::type_id::create("enable");
+    cpol      = uvm_reg_field::type_id::create("cpol");
+    cpha      = uvm_reg_field::type_id::create("cpha");
+    master_en = uvm_reg_field::type_id::create("master_en");
+    clk_div   = uvm_reg_field::type_id::create("clk_div");
+    reserved  = uvm_reg_field::type_id::create("reserved");
+
+    // Spec §4.2 — CTRL_REG
+    enable.configure(   this, 1,  0, "RW", 0, 1'b0,   1, 0, 0);
+    cpol.configure(     this, 1,  1, "RW", 0, 1'b0,   1, 0, 0);
+    cpha.configure(     this, 1,  2, "RW", 0, 1'b0,   1, 0, 0);
+    master_en.configure(this, 1,  3, "RW", 0, 1'b1,   1, 0, 0);
+    clk_div.configure(  this, 8,  4, "RW", 0, 8'h04,  1, 0, 0);
+    reserved.configure( this, 20, 12,"RO", 0, 20'h0,  1, 0, 0);
+  endfunction
+endclass
+
+class spi_status_reg extends uvm_reg;
+  rand uvm_reg_field busy;
+  rand uvm_reg_field tx_empty;
+  rand uvm_reg_field rx_valid;
+  rand uvm_reg_field mode_fault;
+
+  `uvm_object_utils(spi_status_reg)
+
+  virtual function void build();
+    busy       = uvm_reg_field::type_id::create("busy");
+    tx_empty   = uvm_reg_field::type_id::create("tx_empty");
+    rx_valid   = uvm_reg_field::type_id::create("rx_valid");
+    mode_fault = uvm_reg_field::type_id::create("mode_fault");
+
+    busy.configure(      this, 1, 0, "RO", 0, 1'b0, 1, 0, 0);
+    tx_empty.configure(  this, 1, 1, "RO", 0, 1'b1, 1, 0, 0);  // empty at reset
+    rx_valid.configure(  this, 1, 2, "RO", 0, 1'b0, 1, 0, 0);
+    mode_fault.configure(this, 1, 3, "RO", 0, 1'b0, 1, 0, 0);
+  endfunction
+endclass
+
+class spi_int_stat_reg extends uvm_reg;
+  rand uvm_reg_field done;
+  rand uvm_reg_field rx_avail;
+
+  `uvm_object_utils(spi_int_stat_reg)
+
+  virtual function void build();
+    done     = uvm_reg_field::type_id::create("done");
+    rx_avail = uvm_reg_field::type_id::create("rx_avail");
+    done.configure(    this, 1, 0, "W1C", 0, 1'b0, 1, 0, 0);
+    rx_avail.configure(this, 1, 1, "W1C", 0, 1'b0, 1, 0, 0);
+  endfunction
+endclass
+
+class apb_spi_reg_block extends uvm_reg_block;
+  rand spi_ctrl_reg      CTRL;
+  rand spi_status_reg    STATUS;
+  rand uvm_reg           TX_DATA;   // WO — simplified as RW in model
+  rand uvm_reg           RX_DATA;   // RO
+  rand uvm_reg           XFER_LEN;
+  rand uvm_reg           CS_CTRL;
+  rand uvm_reg           INT_EN;
+  rand spi_int_stat_reg  INT_STAT;
+
+  `uvm_object_utils(apb_spi_reg_block)
+
+  virtual function void build();
+    default_map = create_map("csr_map", 0, 4, UVM_LITTLE_ENDIAN);
+
+    CTRL     = spi_ctrl_reg::type_id::create("CTRL");
+    STATUS   = spi_status_reg::type_id::create("STATUS");
+    INT_STAT = spi_int_stat_reg::type_id::create("INT_STAT");
+    // TX_DATA, RX_DATA, XFER_LEN, CS_CTRL, INT_EN — same pattern
+
+    CTRL.configure(this);
+    STATUS.configure(this);
+    INT_STAT.configure(this);
+    CTRL.build();
+    STATUS.build();
+    INT_STAT.build();
+
+    default_map.add_reg(CTRL,     'h00, "RW");
+    default_map.add_reg(STATUS,   'h04, "RO");
+    default_map.add_reg(TX_DATA,  'h08, "RW");
+    default_map.add_reg(RX_DATA,  'h0C, "RO");
+    default_map.add_reg(XFER_LEN, 'h10, "RW");
+    default_map.add_reg(CS_CTRL,  'h14, "RW");
+    default_map.add_reg(INT_EN,   'h18, "RW");
+    default_map.add_reg(INT_STAT, 'h1C, "RW");
+    lock_model();
+  endfunction
+endclass
+```
+
+### Common Model Bugs (for CsrChecker practice)
+
+```systemverilog
+// BUG 1: enable reset is 1 in model but spec says 0
+enable.configure(this, 1, 0, "RW", 0, 1'b1, 1, 0, 0);  // WRONG
+
+// BUG 2: busy marked RW instead of RO
+busy.configure(this, 1, 0, "RW", 0, 1'b0, 1, 0, 0);     // WRONG
+
+// BUG 3: cpha reset wrong — spec Mode 0 default (CPOL=0, CPHA=0) but model has cpha=1
+cpha.configure(this, 1, 2, "RW", 0, 1'b1, 1, 0, 0);     // WRONG — breaks REQ-SPI03 default
+```
+
+CsrChecker should flag all three with spec table row citations.
+
+---
+
+## 0.3 Complete Testbench Initialization
+
+### APB Interface — CSR Port (`tb/interfaces/apb_if.sv`)
+
+```systemverilog
+interface apb_if (input logic pclk, input logic preset_n);
+  logic        PSEL, PENABLE, PWRITE, PREADY, PSLVERR;
+  logic [31:0] PADDR, PWDATA, PRDATA;
+
+  clocking drv_cb @(posedge pclk);
+    default input #1step output #1ns;
+    output PSEL, PENABLE, PWRITE, PADDR, PWDATA;
+    input  PREADY, PRDATA, PSLVERR;
+  endclocking
+
+  clocking mon_cb @(posedge pclk);
+    default input #1step;
+    input PSEL, PENABLE, PWRITE, PADDR, PWDATA, PREADY, PRDATA, PSLVERR;
+  endclocking
+
+  modport drv_mp (clocking drv_cb, input pclk, preset_n);
+  modport mon_mp (clocking mon_cb, input pclk, preset_n);
+endinterface
+```
+
+### SPI Interface — DUT Pins (`tb/interfaces/spi_if.sv`)
+
+```systemverilog
+interface spi_if (input logic sclk_ref);
+  logic       cs_n;
+  logic       mosi;
+  logic       miso;
+
+  // Spec §5.1: sample MISO on configured edge; monitor uses SPI clock
+  clocking mon_cb @(posedge sclk_ref);
+    default input #1step;
+    input cs_n, mosi, miso;
+  endclocking
+
+  // Slave BFM / loopback drives MISO
+  clocking slv_cb @(posedge sclk_ref);
+    default output #0;
+    output miso;
+    input  mosi, cs_n;
+  endclocking
+
+  modport dut_mp  (input cs_n, mosi, miso, sclk_ref);
+  modport mon_mp  (clocking mon_cb, input sclk_ref);
+  modport slv_mp  (clocking slv_cb, input sclk_ref);
+
+  // Loopback tie-off for basic tests (MISO follows MOSI with 1-cycle delay in BFM)
+endinterface
+```
+
+### Top Module (`tb/top/tb_top.sv`)
+
+```systemverilog
+module tb_top;
+  parameter real PCLK_PERIOD = 20.0;   // 50 MHz APB — Spec §2.1
+
+  logic pclk, preset_n;
+  logic sclk;                          // Tied from DUT or observed
+
+  initial begin
+    pclk = 0;
+    forever #(PCLK_PERIOD/2) pclk = ~pclk;
+  end
+
+  initial begin
+    preset_n = 0;
+    repeat (5) @(posedge pclk);
+    preset_n = 1;
+  end
+
+  apb_if apb_vif(pclk, preset_n);
+  spi_if spi_vif(sclk);
+
+  apb_spi_master dut (
+    .pclk    (pclk),
+    .preset_n(preset_n),
+    .psel    (apb_vif.PSEL),
+    .penable (apb_vif.PENABLE),
+    .pwrite  (apb_vif.PWRITE),
+    .paddr   (apb_vif.PADDR),
+    .pwdata  (apb_vif.PWDATA),
+    .prdata  (apb_vif.PRDATA),
+    .pready  (apb_vif.PREADY),
+    .pslverr (apb_vif.PSLVERR),
+    .sclk    (sclk),
+    .cs_n    (spi_vif.cs_n),
+    .mosi    (spi_vif.mosi),
+    .miso    (spi_vif.miso)
+  );
+
+  // SPI slave BFM: loopback for REQ-SPI05
+  spi_loopback_bfm #(.PIPE_DELAY(0)) slv_bfm (
+    .vif(spi_vif),
+    .sclk(sclk)
+  );
+
+  initial begin
+    uvm_config_db#(virtual apb_if)::set(
+      null, "uvm_test_top.env.apb_agent.*", "vif", apb_vif);
+    uvm_config_db#(virtual spi_if)::set(
+      null, "uvm_test_top.env.spi_agent.*", "vif", spi_vif);
+    run_test();
+  end
+endmodule
+```
+
+### Environment `build_phase` (`tb/env/apb_spi_env.sv`)
+
+```systemverilog
+class apb_spi_env extends uvm_env;
+  apb_agent          apb_agent;    // Programs CSRs
+  spi_agent          spi_agent;    // Monitors SPI + optional slave BFM
+  apb_spi_reg_block  reg_model;
+  apb_reg_adapter    reg_adapter;
+  spi_scoreboard     scb;
+
+  `uvm_component_utils(apb_spi_env)
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    apb_agent = apb_agent::type_id::create("apb_agent", this);
+    spi_agent = spi_agent::type_id::create("spi_agent", this);
+    scb       = spi_scoreboard::type_id::create("scb", this);
+
+    reg_model = apb_spi_reg_block::type_id::create("reg_model");
+    reg_model.build();
+    reg_model.lock_model();
+    reg_model.reset();
+
+    reg_adapter = apb_reg_adapter::type_id::create("reg_adapter");
+    reg_model.default_map.set_sequencer(apb_agent.sequencer, reg_adapter);
+  endfunction
+
+  function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+    spi_agent.monitor.ap.connect(scb.spi_fifo);
+    apb_agent.monitor.ap.connect(scb.apb_fifo);
+  endfunction
+endclass
+```
+
+### Initialization Sequence — Program SPI Mode Before Transfer
+
+```systemverilog
+class spi_csr_init_seq extends uvm_sequence;
+  apb_spi_reg_block reg_model;
+  `uvm_object_utils(spi_csr_init_seq)
+
+  task body();
+    uvm_status_e status;
+    uvm_reg_data_t rd;
+
+    // 1. Verify reset: enable=0, cpol=cpha=0 (Mode 0), tx_empty=1
+    reg_model.CTRL.enable.read(status, rd, UVM_BACKDOOR);
+    if (rd != 0) `uvm_error("INIT", "CTRL.enable not 0 at reset")
+
+    // 2. Program SPI Mode 0, divider, enable block
+    reg_model.CTRL.cpol.write(status, 0, UVM_FRONTDOOR);
+    reg_model.CTRL.cpha.write(status, 0, UVM_FRONTDOOR);
+    reg_model.CTRL.clk_div.write(status, 8'h08, UVM_FRONTDOOR);
+    reg_model.CTRL.enable.write(status, 1, UVM_FRONTDOOR);
+
+    // 3. Deassert CS (active low) — idle bus
+    reg_model.CS_CTRL.write(status, 32'h1, UVM_FRONTDOOR);
+
+    // 4. Clear sticky interrupts
+    reg_model.INT_STAT.done.write(status, 1, UVM_FRONTDOOR);
+    reg_model.INT_STAT.rx_avail.write(status, 1, UVM_FRONTDOOR);
+  endtask
+endclass
+```
+
+### SPI Transfer Sequence — 8-Byte Write/Read (`tb/sequences/spi_mode0_8b_seq.sv`)
+
+```systemverilog
+class spi_mode0_8b_seq extends uvm_sequence;
+  apb_spi_reg_block reg_model;
+  byte payload[] = '{8'hA5, 8'h3C, 8'hFF, 8'h00, 8'h55, 8'hAA, 8'h12, 8'h34};
+
+  task body();
+    uvm_status_e status;
+    uvm_reg_data_t rd;
+    int i;
+
+    // Program length — Spec §4.2 XFER_LEN
+    reg_model.XFER_LEN.write(status, payload.size(), UVM_FRONTDOOR);
+
+    // Assert CS — Spec §5.2
+    reg_model.CS_CTRL.write(status, 32'h0, UVM_FRONTDOOR);
+
+  // Push TX bytes (each write to TX_DATA starts/shifts per design)
+    foreach (payload[i]) begin
+      reg_model.TX_DATA.write(status, payload[i], UVM_FRONTDOOR);
+    end
+
+    // Poll STATUS.busy — wait for shift engine
+    do reg_model.STATUS.busy.read(status, rd, UVM_FRONTDOOR);
+    while (rd[0] == 1);
+
+    // Read back RX FIFO — loopback should match payload
+    foreach (payload[i]) begin
+      reg_model.RX_DATA.read(status, rd, UVM_FRONTDOOR);
+      if (rd[7:0] != payload[i])
+        `uvm_error("SPI", $sformatf("loopback mismatch idx %0d exp %02h got %02h",
+          i, payload[i], rd[7:0]))
+    end
+
+    // Deassert CS
+    reg_model.CS_CTRL.write(status, 32'h1, UVM_FRONTDOOR);
+  endtask
+endclass
+```
+
+---
+
+## 0.4 Complete CSR Tests (Generated by `/generate-csr-test`)
+
+### Reset Value Test (`tb/tests/csr_reset_test.sv`)
+
+```systemverilog
+class csr_reset_test extends apb_spi_base_test;
+  `uvm_component_utils(csr_reset_test)
+
+  task run_phase(uvm_phase phase);
+    uvm_status_e status;
+    uvm_reg_data_t val;
+    uvm_reg regs[$];
+    string reg_name;
+
+    phase.raise_objection(this);
+
+    env.reg_model.get_registers(regs);
+
+    foreach (regs[i]) begin
+      reg_name = regs[i].get_name();
+      regs[i].read(status, val, UVM_BACKDOOR);
+      if (status != UVM_IS_OK) begin
+        `uvm_error("CSR_RST", $sformatf("%s read failed", reg_name))
+        continue;
+      end
+      if (val != regs[i].get_reset())
+        `uvm_error("CSR_RST", $sformatf(
+          "%s: reset mismatch exp=0x%0h got=0x%0h",
+          reg_name, regs[i].get_reset(), val))
+      else
+        `uvm_info("CSR_RST", $sformatf("%s PASS (0x%0h)", reg_name, val), UVM_LOW)
+    end
+
+    phase.drop_objection(this);
+  endtask
+endclass
+```
+
+### RW Accessibility Test — RO Field Check (`tb/tests/csr_rw_test.sv`)
+
+```systemverilog
+task check_ro_field(uvm_reg_field fld, string id);
+  uvm_status_e status;
+  uvm_reg_data_t before, after, wr_val;
+
+  fld.read(status, before, UVM_FRONTDOOR);
+  assert(status == UVM_IS_OK);
+
+  wr_val = before ^ 32'hFFFF_FFFF;  // Toggle all bits
+  fld.write(status, wr_val, UVM_FRONTDOOR);
+  assert(status == UVM_IS_OK);
+
+  fld.read(status, after, UVM_FRONTDOOR);
+  assert(status == UVM_IS_OK);
+
+  if (after != before)
+    `uvm_error(id, $sformatf(
+      "RO violation: before=0x%0h after=0x%0h wrote=0x%0h",
+      before, after, wr_val))
+  else
+    `uvm_info(id, "RO field unchanged after write — PASS", UVM_MEDIUM)
+endtask
+
+task run_phase(uvm_phase phase);
+  phase.raise_objection(this);
+  check_ro_field(env.reg_model.STATUS.busy,       "STATUS.busy");
+  check_ro_field(env.reg_model.STATUS.tx_empty, "STATUS.tx_empty");
+  check_ro_field(env.reg_model.STATUS.rx_valid, "STATUS.rx_valid");
+  phase.drop_objection(this);
+endtask
+```
+
+### SPI Loopback Test (`tb/tests/spi_loopback_test.sv`)
+
+```systemverilog
+class spi_loopback_test extends apb_spi_base_test;
+  `uvm_component_utils(spi_loopback_test)
+
+  task run_phase(uvm_phase phase);
+    spi_csr_init_seq  init_seq;
+    spi_mode0_8b_seq  xfer_seq;
+
+    phase.raise_objection(this);
+    init_seq = spi_csr_init_seq::type_id::create("init_seq");
+    init_seq.reg_model = env.reg_model;
+    init_seq.start(null);
+
+    xfer_seq = spi_mode0_8b_seq::type_id::create("xfer_seq");
+    xfer_seq.reg_model = env.reg_model;
+    xfer_seq.start(null);
+    phase.drop_objection(this);
+  endtask
+endclass
+```
+
+### W1C Test for `INT_STAT.done`
+
+```systemverilog
+task check_w1c_field(uvm_reg_field fld);
+  uvm_status_e status;
+  uvm_reg_data_t val;
+
+  // Set sticky bit via backdoor (simulate hardware event)
+  fld.write(status, 1'b1, UVM_BACKDOOR);
+  fld.read(status, val, UVM_FRONTDOOR);
+  assert(val == 1);
+
+  // Write 1 to clear (spec §4.2 W1C)
+  fld.write(status, 1'b1, UVM_FRONTDOOR);
+  fld.read(status, val, UVM_FRONTDOOR);
+  if (val != 0)
+    `uvm_error("W1C", "Field did not clear on write-1")
+endtask
+```
+
+---
+
+## 0.5 Directed Sequence for Coverage Closure
+
+### APB Covergroup (`tb/coverage/apb_trans_cg.sv`)
+
+```systemverilog
+covergroup apb_trans_cg with function sample(bit is_write, bit [1:0] rsp, bit b2b);
+  cp_kind: coverpoint is_write { bins rd = {0}; bins wr = {1}; }
+  cp_rsp: coverpoint rsp {
+    bins okay   = {2'b00};
+    bins slverr = {2'b11};   // REQ-APB03
+  }
+  cx_wr_slverr: cross cp_kind, cp_rsp {
+    bins wr_slverr = binsof(cp_kind.wr) && binsof(cp_rsp.slverr);
+  }
+endgroup
+```
+
+### SPI Transfer Covergroup (`tb/coverage/spi_xfer_cg.sv`)
+
+```systemverilog
+covergroup spi_xfer_cg with function sample(
+  bit cpol, bit cpha, int unsigned num_bytes, bit cs_glitch
+);
+  option.per_instance = 1;
+
+  cp_mode: coverpoint {cpol, cpha} {
+    bins mode0 = {2'b00};   // REQ-SPI03
+    bins mode1 = {2'b01};
+    bins mode2 = {2'b10};
+    bins mode3 = {2'b11};
+  }
+
+  cp_len: coverpoint num_bytes {
+    bins single = {1};
+    bins few    = {[2:4]};
+    bins many   = {[5:64]};
+    bins illegal_zero = {0};  // REQ-SPI04 — expect mode_fault, not normal xfer
+  }
+
+  cp_cs: coverpoint cs_glitch {
+    bins clean  = {0};
+    bins glitch = {1};      // CS toggled mid-transfer — error path
+  }
+
+  cx_mode_len: cross cp_mode, cp_len;
+endgroup
+```
+
+### Directed Sequence — SPI Mode Sweep (`tb/sequences/spi_cpol_cpha_sweep_seq.sv`)
+
+```systemverilog
+class spi_cpol_cpha_sweep_seq extends uvm_sequence;
+  apb_spi_reg_block reg_model;
+
+  task body();
+    uvm_status_e status;
+    bit modes[$] = '{2'b00, 2'b01, 2'b10, 2'b11};
+
+    foreach (modes[i]) begin
+      reg_model.CTRL.cpol.write(status, modes[i][1], UVM_FRONTDOOR);
+      reg_model.CTRL.cpha.write(status, modes[i][0], UVM_FRONTDOOR);
+      `uvm_info("SWEEP", $sformatf("SPI Mode %0d (CPOL=%0b CPHA=%0b)",
+        i, modes[i][1], modes[i][0]), UVM_LOW)
+      // Run 4-byte loopback sub-transfer per mode
+      run_loopback_n_bytes(4);
+    end
+  endtask
+endclass
+```
+
+### Directed Sequence — Inject SLVERR on APB (`tb/sequences/apb_slverr_inj_seq.sv`)
+
+```systemverilog
+class apb_slverr_inj_seq extends apb_base_seq;
+  `uvm_object_utils(apb_slverr_inj_seq)
+
+  task body();
+    apb_transaction tr;
+
+    // Use unmapped address per spec §3.6
+    tr = apb_transaction::type_id::create("tr");
+    start_item(tr);
+    tr.kind   = APB_WRITE;
+    tr.addr   = 32'h0000_FFFC;   // Unmapped — DUT asserts PSLVERR
+    tr.data   = 32'hDEAD_BEEF;
+    tr.expect_slverr = 1;
+    finish_item(tr);
+
+    `uvm_info("SEQ", "Sent write to unmapped addr — expect PSLVERR", UVM_MEDIUM)
+  endtask
+endclass
+```
+
+### Coverage Exclusion File
+
+```systemverilog
+// EXCLUDE: Spec §5.3 — SPI Mode 3 at clk_div=0 not supported (min divider is 4)
+// Instance: spi_xfer_cg.cp_mode.mode3_at_div0
+
+// EXCLUDE: Spec §5.4 — byte_count=0 is illegal path, covered by mode_fault test not xfer
+// Instance: spi_xfer_cg.cp_len.illegal_zero  (sample only in spi_zero_len_test)
+```
+
+---
+
+## 0.6 Monitor vs Driver — Rule Enforcement Example
+
+### APB: Passive Monitor
+
+**Wrong (monitor drives — violates passive monitor rule):**
+
+```systemverilog
+// apb_monitor.sv — INCORRECT
+task run_phase(uvm_phase phase);
+  forever begin
+    @(vif.mon_cb);
+    if (vif.mon_cb.PSEL && !vif.mon_cb.PENABLE)
+      vif.mon_cb.PREADY = 1;   // ERROR: monitor must never drive
+    // ...
+  end
+endtask
+```
+
+**Correct (passive monitor + separate driver):**
+
+```systemverilog
+// apb_monitor.sv — CORRECT
+task run_phase(uvm_phase phase);
+  apb_transaction tr;
+  forever begin
+    @(vif.mon_cb);
+    if (vif.mon_cb.PSEL && vif.mon_cb.PENABLE && vif.mon_cb.PREADY) begin
+      tr = apb_transaction::type_id::create("tr");
+      tr.kind = vif.mon_cb.PWRITE ? APB_WRITE : APB_READ;
+      tr.addr = vif.mon_cb.PADDR;
+      tr.data = vif.mon_cb.PWRITE ? vif.mon_cb.PWDATA : vif.mon_cb.PRDATA;
+      tr.slverr = vif.mon_cb.PSLVERR;
+      ap.write(tr);
+    end
+  end
+endtask
+
+// apb_driver.sv — drives PREADY only here
+task drive_transfer(apb_transaction tr);
+  @(vif.drv_cb);
+  vif.drv_cb.PSEL    <= 1;
+  vif.drv_cb.PENABLE <= 1;
+  vif.drv_cb.PWRITE  <= (tr.kind == APB_WRITE);
+  vif.drv_cb.PADDR   <= tr.addr;
+  vif.drv_cb.PWDATA  <= tr.data;
+  do @(vif.drv_cb); while (!vif.drv_cb.PREADY);
+  vif.drv_cb.PSEL    <= 0;
+  vif.drv_cb.PENABLE <= 0;
+endtask
+```
+
+### SPI: Monitor Samples Bus; Slave BFM Drives MISO Only
+
+**Wrong — SPI monitor drives MOSI (master line):**
+
+```systemverilog
+// spi_monitor.sv — INCORRECT
+@(vif.mon_cb);
+vif.mon_cb.mosi = expected_mosi;  // ERROR: monitor never drives
+```
+
+**Correct — SPI monitor captures; slave BFM drives MISO for loopback:**
+
+```systemverilog
+// spi_monitor.sv — CORRECT (passive on MOSI/SCLK/CS)
+task run_phase(uvm_phase phase);
+  spi_transaction tr;
+  forever begin
+    @(vif.mon_cb);
+    if (!vif.mon_cb.cs_n) begin
+      tr = spi_transaction::type_id::create("tr");
+      tr.mosi = vif.mon_cb.mosi;
+      tr.miso = vif.mon_cb.miso;
+      tr.sclk_edge = 1;
+      ap.write(tr);
+    end
+  end
+endtask
+
+// spi_loopback_bfm.sv — drives MISO only (slave role)
+always @(posedge sclk) begin
+  if (!vif.cs_n)
+    vif.slv_cb.miso <= vif.slv_cb.mosi;  // 0-delay loopback for REQ-SPI05
+end
+```
+
+---
+
+## 0.7 Command Session Transcripts (Expected Output)
+
+### `/run-sim --test csr_reset_test --seed 42`
+
+```
+## Simulation Summary
+
+**Test**: csr_reset_test
+**Seed**: 42
+**Result**: FAIL
+
+### UVM Report
+- UVM_INFO:    847
+- UVM_WARNING: 2
+  - [CSR_INIT] INT_EN.err_ie reset is 1 — confirm with designer (Spec §4.2)
+- UVM_ERROR:   1
+  - [CSR_RST] CTRL.enable: reset mismatch exp=0x0 got=0x1
+- UVM_FATAL:   0
+
+### Coverage
+- Functional coverage: 12% (early test — only CSR path exercised)
+- Code coverage:        8%
+- Coverage DB: cov_work/csr_reset_test_42/
+
+### Suggested Next Steps
+1. Fix CTRL.enable reset in apb_spi_reg_block.sv line 22 (1'b1 → 1'b0)
+2. Re-run: /run-sim --test csr_reset_test --seed 42 --no-compile
+```
+
+### `/run-sim --test spi_loopback_test --seed 7`
+
+```
+## Simulation Summary
+
+**Test**: spi_loopback_test
+**Seed**: 7
+**Result**: PASS
+
+### UVM Report
+- UVM_INFO:    1204
+- UVM_WARNING: 0
+- UVM_ERROR:   0
+- UVM_FATAL:   0
+
+### Coverage
+- Functional coverage: 64% (spi_xfer_cg mode0/1 covered, mode2/3 pending)
+- apb_trans_cg: 41%
+- Coverage DB: cov_work/spi_loopback_test_7/
+```
+
+### `/check-coverage --threshold 90`
+
+```
+## Coverage Analysis Report
+
+**Merged runs**: 12
+**Overall functional coverage**: 88.1%
+**Overall code coverage**:        90.4%
+
+### ⚠️ Uncovered Functional Bins
+
+| Covergroup    | Bin                    | Current | Suggested Test              |
+|--------------|------------------------|---------|----------------------------|
+| apb_trans_cg | cp_rsp.slverr          | 0%      | apb_slverr_inj_seq         |
+| spi_xfer_cg  | cp_mode.mode2          | 0%      | spi_cpol_cpha_sweep_seq    |
+| spi_xfer_cg  | cp_mode.mode3          | 0%      | spi_cpol_cpha_sweep_seq    |
+| spi_xfer_cg  | cp_len.many            | 42%     | spi_mode0_64b_seq          |
+| spi_xfer_cg  | cp_cs.glitch           | 0%      | spi_cs_glitch_test         |
+
+### ⚠️ Uncovered Code
+
+| Module          | Line | Type   | Notes                              |
+|----------------|------|--------|------------------------------------|
+| apb_spi_master | 156  | Branch | mode_fault state not entered       |
+| apb_spi_master | 203  | FSM    | SPI Mode 2 shift path              |
+
+### 🔴 Assertions Never Fired
+
+| Assertion                 | Location              | Notes                    |
+|--------------------------|-----------------------|--------------------------|
+| assert_cs_setup_before_sclk | apb_spi_master.sv:72 | REQ-SPI02 timing check   |
+| assert_msb_first_mosi    | apb_spi_master.sv:95  | REQ-SPI01                |
+
+### Recommended Closure Order
+1. spi_cpol_cpha_sweep_seq  (closes mode2/mode3 — REQ-SPI03)
+2. apb_slverr_inj_seq       (closes APB SLVERR bins)
+3. spi_zero_len_test        (mode_fault + assert coverage)
+```
+
+### CsrChecker Agent — Sample Report
+
+```
+## CSR Compliance Report: apb_spi_reg_block
+
+### Summary
+- Registers checked: 9
+- PASS: 6
+- FAIL: 3
+- CRITICAL: 2
+
+### Critical Issues
+
+1. **CTRL.enable** — Spec reset 0x0, model reset 0x1 (spi_ctrl_reg.sv:22)
+2. **STATUS.busy** — Spec RO, model RW (spi_status_reg.sv:38)
+
+### Warnings
+
+1. **CTRL.cpha** — Spec default Mode 0 (CPHA=0), model reset CPHA=1
+   - Impact: Default SPI mode wrong until software rewrites CTRL
+
+### Clean Registers
+CTRL.cpol, CTRL.clk_div, STATUS.tx_empty, TX_DATA map, RX_DATA map, INT_STAT
+```
+
+---
+
+## 0.8 End-to-End Day Flow (All Artifacts Together)
+
+```mermaid
+flowchart TD
+  A["SpecReader\n§4.2 CSR + §5 SPI"] --> B["reg model + spi_if init"]
+  B --> C["/generate-csr-test"]
+  C --> D["/run-sim csr_reset_test"]
+  D --> E{Pass?}
+  E -->|No| F["CsrChecker\nfix model"]
+  F --> D
+  E -->|Yes| G["spi_loopback_test\n+ mode sweep"]
+  G --> H["/check-coverage"]
+  H --> I["CoverageAnalyzer\nspi_xfer holes"]
+  I --> J["/tb-checkpoint"]
+```
+
+| Step | Artifact | What You Do | Outcome |
+|------|----------|-------------|---------|
+| 1 | **Agent** SpecReader | "Extract APB CSR + SPI reqs from spec §4–5" | REQ-APB*, REQ-CSR*, REQ-SPI* |
+| 2 | **Rule** uvm-coding-standard | Edit `apb_spi_reg_block.sv`, `spi_if.sv` | Naming + passive monitors |
+| 3 | **Skill** var-initialization | "Set up apb_if, spi_if, config_db" | `tb_top.sv`, dual-agent env |
+| 4 | **Command** `/generate-csr-test` | Generate CSR tests | `csr_reset_test`, `csr_rw_test` |
+| 5 | **Command** `/run-sim` | `csr_reset_test` | UVM_ERROR on CTRL.enable |
+| 6 | **Agent** CsrChecker | Audit reg model vs §4.2 table | Fix enable, busy, cpha reset |
+| 7 | **Command** `/run-sim` | `spi_loopback_test` | REQ-SPI05 pass |
+| 8 | **Skill** coverage-closure | After `/check-coverage` | `spi_cpol_cpha_sweep_seq` for mode2/3 |
+| 9 | **Command** `/tb-checkpoint` | Commit | `tb: SPI mode sweep + loopback` |
+
+---
+
 # Part 1: Rules
 
 ## What Rules Are
@@ -218,6 +1133,86 @@ force dut.ctrl_reg = wr_data;
 ## Field Access Width
 - Never write a full register word if only one field is being configured
 - Use field-level API: `reg_block.ctrl_reg.enable_field.write(...)`
+```
+
+### Example Rule: Assertion and Coverage Naming
+
+```yaml
+---
+description: "SVA assertion and functional coverage naming conventions"
+globs: ["**/*_sva.sv", "**/assertions/**", "**/*_cg.sv", "**/coverage/**"]
+alwaysApply: false
+---
+
+## Assertion Naming
+
+Format: `assert_<module>_<condition>`
+
+```systemverilog
+// CORRECT
+assert_spi_cs_before_sclk: assert property (@(posedge pclk) disable iff (!preset_n)
+  spi_xfer_start |-> ##1 (!cs_n)
+) else `uvm_error("SVA", "CS_n not asserted before first SCLK — Spec §5.2")
+
+assert_spi_zero_len_fault: assert property (@(posedge pclk) disable iff (!preset_n)
+  (byte_count == 0 && xfer_start) |-> ##[1:5] mode_fault
+) else `uvm_error("SVA", "mode_fault not set for byte_count=0 — Spec §5.4")
+
+// INCORRECT
+assert1: assert property (...);   // no descriptive name
+```
+
+## Covergroup Naming
+
+Format: `<interface_or_feature>_cg` with coverpoints `cp_<name>`
+
+```systemverilog
+// CORRECT — sampled from monitor, not driver
+covergroup apb_trans_cg with function sample(apb_transaction tr);
+  cp_write: coverpoint tr.kind { bins rd = {APB_READ}; bins wr = {APB_WRITE}; }
+  cp_slverr: coverpoint tr.slverr { bins ok = {0}; bins err = {1}; }
+endgroup
+
+// INCORRECT — covergroup inside RTL module (belongs in TB)
+```
+
+## Coverage Exclusion Comments
+
+Every excluded bin must cite spec:
+
+```systemverilog
+// EXCLUDE: APB_SPI_Master_Spec_v1.2 §2.1 — zero-length transfer prohibited
+// Instance: rx_cg.cp_len.SIZE_0
+```
+```
+
+### Example Rule: Testbench File Organization
+
+```yaml
+---
+description: "Testbench directory structure and file placement standards"
+globs: ["tb/**"]
+alwaysApply: false
+---
+
+## File Placement
+
+| Content | Directory | Example |
+|---------|-----------|---------|
+| Interfaces | `tb/interfaces/` | `apb_if.sv` |
+| Agents | `tb/agents/<name>/` | `apb_driver.sv` |
+| Register model | `tb/reg_model/` | `apb_spi_reg_block.sv` |
+| Sequences | `tb/sequences/` | `apb_slverr_inj_seq.sv` |
+| Tests | `tb/tests/` | `csr_reset_test.sv` |
+| Coverage | `tb/coverage/` | `apb_trans_cg.sv` |
+| Assertions (TB-side) | `tb/assertions/` | `apb_spi_master_sva.sv` |
+| Top | `tb/top/` | `tb_top.sv` |
+
+## Do Not Commit
+
+- `*.wlf`, `*.fsdb` waveform files
+- `cov_work/`, `*.ucdb`, `*.vdb` coverage databases
+- `transcript`, `vsim.wlf`, `work/` compile library (use .gitignore)
 ```
 
 ---
@@ -402,6 +1397,40 @@ Run all tests in regression list `tests/regression.list`.
 - Coverage DB: `cov_work/<testname>/`
 ```
 
+### Elaborated: Simulator Commands the Agent Runs
+
+When `/run-sim` executes, the agent should use project-specific scripts or these Questa/ModelSim equivalents:
+
+```bash
+# 1. Compile (from project root)
+vlog -sv +incdir+tb +incdir+tb/agents/apb \
+  +define+UVM_NO_DEPRECATED \
+  -f tb/filelist.f
+
+# 2. Elaborate + simulate with coverage
+vsim -c tb_top -voptargs=+acc \
+  +UVM_TESTNAME=csr_reset_test \
+  +UVM_VERBOSITY=UVM_MEDIUM \
+  -sv_seed 42 \
+  -coverage \
+  -do "coverage save -onexit cov_work/csr_reset_test_42/cov.ucdb; run -all; quit -f"
+
+# 3. Alternative: Makefile wrapper
+make sim TEST=csr_reset_test SEED=42 COV=1
+```
+
+**`tests/regression.list` format:**
+
+```
+# test_name          seed    coverage    description
+csr_reset_test       1       on          Reset value check all CSRs
+csr_rw_test          1       on          RO/WO/W1C accessibility
+apb_sanity_test      1       on          Basic APB read/write
+spi_random_test      random  on          Random SPI len/mode/payload
+```
+
+**`/run-sim --regress` behavior:** Run each non-comment line sequentially; merge all `cov_work/<test>_*/` into `cov_work/merged.ucdb` after last test.
+
 ---
 
 ### Example: The /check-coverage Command
@@ -581,6 +1610,55 @@ Generate tests for a single register only.
 Generate tests for a single field only.
 ```
 
+### Elaborated: Full Generated Test Package
+
+After `/generate-csr-test --reg ctrl_reg_block`, the agent produces:
+
+**File: `tb/tests/csr_reset_test.sv`** — see §0.4 above.
+
+**File: `tb/sequences/csr_rw_walking_seq.sv`** (walking-ones for RW fields):
+
+```systemverilog
+class csr_rw_walking_seq extends uvm_sequence;
+  apb_spi_reg_block reg_model;
+  uvm_reg_field fields[$];
+
+  task body();
+    uvm_status_e status;
+    uvm_reg_data_t rd, wr;
+    int width;
+
+    reg_model.CTRL.get_fields(fields);
+    foreach (fields[i]) begin
+      if (fields[i].get_access() != "RW") continue;
+      width = fields[i].get_n_bits();
+      for (int b = 0; b < width; b++) begin
+        wr = 1 << b;
+        fields[i].write(status, wr, UVM_FRONTDOOR);
+        fields[i].read(status, rd, UVM_FRONTDOOR);
+        if (rd !== wr)
+          `uvm_error("WALK", $sformatf("%s bit %0d: wr=0x%0h rd=0x%0h",
+            fields[i].get_name(), b, wr, rd))
+      end
+      fields[i].write(status, '0, UVM_FRONTDOOR);  // restore
+    end
+  endtask
+endclass
+```
+
+**File: `tb/tests/csr_alias_test.sv`** (when spec defines alias at 0x00 and 0x80):
+
+```systemverilog
+task check_alias(uvm_reg primary, uvm_reg alias_reg);
+  uvm_status_e status;
+  uvm_reg_data_t v1, v2;
+  primary.write(status, 32'hA5A5_0001, UVM_FRONTDOOR);
+  alias_reg.read(status, v2, UVM_FRONTDOOR);
+  if (v2 != 32'hA5A5_0001)
+    `uvm_error("ALIAS", "Aliased addresses returned different values")
+endtask
+```
+
 ---
 
 ## Command Coalescing (Verification Workflows)
@@ -710,11 +1788,11 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    User["User: Add APB write burst test"]
+    User["User: Add SPI CPOL/CPHA mode sweep test"]
 
     subgraph Autonomous["Autonomous Actions"]
         Analyze["ANALYZE spec section"]
-        Write["WRITE apb_burst_seq.sv"]
+        Write["WRITE spi_cpol_cpha_sweep_seq.sv"]
         Review["REVIEW sequence code"]
     end
 
@@ -732,10 +1810,10 @@ flowchart TD
 
 | Phase | Action | Details |
 |-------|--------|---------|
-| **Analyze** | Read spec | APB burst write section 4.3 — max 4-beat burst, OKAY/SLVERR response |
-| **Write** | Created sequence | `apb_burst_wr_seq.sv` — 1, 2, 4-beat variants, error injection |
-| **Review** | Self-checked | All burst lengths covered, status checked, no monitor driving |
-| **Checkpoint** | Committed | `tb: add APB write burst sequence` |
+| **Analyze** | Read spec | SPI §5.1 — modes 0–3 (CPOL/CPHA), CS setup, MSB-first |
+| **Write** | Created sequence | `spi_cpol_cpha_sweep_seq.sv` — all four modes, 8-bit xfer |
+| **Review** | Self-checked | All mode bins hit, STATUS.busy polled, no monitor driving |
+| **Checkpoint** | Committed | `tb: add SPI mode sweep sequence` |
 | **Sim** | **Reported** | PASS — 0 UVM_ERROR, func cov 81% |
 | **Push** | **Awaiting** | Requires confirmation (affects shared regression) |
 
@@ -906,6 +1984,33 @@ Verify all registers in a register block against the specification-defined:
 - If spec is ambiguous, flag for human review
 ```
 
+### Elaborated: CSR Skill Step-by-Step on `apb_spi_master`
+
+**User:** "Verify all registers in apb_spi_master against the spec"
+
+**Skill execution trace:**
+
+| Step | Action | Detail |
+|------|--------|--------|
+| 1 | Load spec §4.2 table | 7 registers, 12 fields extracted |
+| 2 | Parse `apb_spi_reg_block.sv` | 7 `uvm_reg` instances found |
+| 3 | Cross-check | 2 mismatches: CTRL.enable reset, STATUS.busy access |
+| 4 | Generate tests | `csr_reset_test.sv`, `csr_rw_test.sv` already exist — offer update |
+| 5 | Run `/run-sim --test csr_reset_test` | 1 UVM_ERROR — confirms finding |
+| 6 | Report | CSR Compliance Report (see §0.7 CsrChecker sample) |
+
+**Walking-ones result table (excerpt):**
+
+| Register.Field | Bit | Write | Read | Result |
+|---------------|-----|-------|------|--------|
+| CTRL.enable | 0 | 1 | 1 | PASS |
+| CTRL.mode | 1 | 2 | 2 | PASS |
+| CTRL.mode | 0 | 1 | 1 | PASS |
+| TX_DATA.data | 0 | 1 | 1 | PASS |
+| TX_DATA.data | 7 | 8'hFF | 8'hFF | PASS |
+| CLK_DIV.div | 0 | 1 | 1 | PASS |
+| CLK_DIV.div | 7 | 8'h0F | 8'h0F | PASS |
+
 ---
 
 ### The Coverage Closure Skill
@@ -968,6 +2073,31 @@ For each reachable hole:
 | `rx_cg.pkt_size` | `SIZE_0` | Spec prohibits zero-length packets |
 ```
 
+### Elaborated: Coverage Closure Session
+
+**Starting point:** `apb_trans_cg` at 73%, `cp_rsp.slverr` at 0%.
+
+**CoverageAnalyzer reasoning:**
+
+1. **Bin `cp_rsp.slverr`** — Reachable. Spec §3.6 requires SLVERR on illegal address. No exclusion.
+2. **Action** — Write `apb_slverr_inj_seq` (see §0.5).
+3. **Re-run** — `/run-sim --test apb_sanity_test --seed 99` with sequence added to base test.
+4. **Result** — `cp_rsp.slverr` → 100%, `cx_wr_slverr` → 100%, overall `apb_trans_cg` → 91%.
+
+**Scoreboard check after SLVERR sequence:**
+
+```systemverilog
+// spi_scoreboard.sv — must expect SLVERR on APB without UVM_ERROR storm
+function void write(apb_transaction tr);
+  if (tr.slverr) begin
+    `uvm_info("SCB", $sformatf("SLVERR on %s addr=0x%0h — expected for unmapped",
+      tr.kind.name(), tr.addr), UVM_MEDIUM)
+    return;  // do not compare data on error response
+  end
+  // normal compare ...
+endfunction
+```
+
 ---
 
 ### The Spec Extraction Skill
@@ -1020,6 +2150,33 @@ For each spec statement containing a requirement (shall, must, shall not):
 - Do not invent requirements not stated in spec
 ```
 
+### Elaborated: Spec Extraction from SPI Spec Prose
+
+**Input (spec §5.4 prose):**
+
+> "When XFER_LEN.byte_count is programmed to zero, the SPI master shall not toggle SCLK and shall assert STATUS.mode_fault. The fault shall remain set until software clears INT_STAT or reprograms byte_count to a non-zero value."
+
+**Extracted requirements:**
+
+| Req ID | Verbatim fragment | Classification | Test Scenario |
+|--------|------------------|----------------|---------------|
+| REQ-SPI04a | "shall not toggle SCLK" | protocol | `spi_zero_len_test` |
+| REQ-SPI04b | "shall assert STATUS.mode_fault" | CSR + functional | same test |
+| REQ-SPI04c | "remain set until ... clears INT_STAT or reprograms byte_count" | functional | `spi_zero_len_clear_test` |
+
+**Suggested sequence outline:**
+
+```systemverilog
+// spi_zero_len_test outline
+reg_model.XFER_LEN.write(status, 0, UVM_FRONTDOOR);
+reg_model.TX_DATA.write(status, 8'hFF, UVM_FRONTDOOR);  // attempt push
+#200ns;
+reg_model.STATUS.mode_fault.read(status, val, UVM_FRONTDOOR);
+assert(val[3] == 1);
+// SPI monitor: zero SCLK edges while cs_n low — Spec §5.4
+spi_monitor.check_sclk_count(0);
+```
+
 ---
 
 ### The Variable Initialization Skill
@@ -1047,20 +2204,20 @@ metadata:
 ### 1. Identify Interfaces and Parameters
 - List all DUT interfaces with direction and signal list
 - Extract clock domains and reset polarities from spec
-- Identify interface parameters (data width, address width, burst length)
+- Identify interface parameters (APB data width, SPI frame width, max byte count)
 
 ### 2. Generate Parameter Initialization
 
 ```sv
 // Interface parameters — match RTL spec Table 2.1
-parameter int DATA_WIDTH  = 32;   // Spec §2.1: AXI data bus width
-parameter int ADDR_WIDTH  = 32;   // Spec §2.1: AXI address bus width
-parameter int ID_WIDTH    = 4;    // Spec §2.1: AXI transaction ID width
-parameter int BURST_LEN   = 255;  // Spec §3.4: max burst length
+parameter int APB_DATA_WIDTH  = 32;   // Spec §2.1: APB PDATA width
+parameter int APB_ADDR_WIDTH  = 12;   // Spec §2.1: CSR address space
+parameter int SPI_DATA_WIDTH  = 8;    // Spec §3.1: byte-wide shift register
+parameter int SPI_MAX_BYTES   = 64;   // Spec §4.5: XFER_LEN.byte_count max
 
 // Clock periods (ns) — from timing spec Table 5.2
-parameter real CLK_PERIOD_SYS  = 10.0;  // 100 MHz system clock
-parameter real CLK_PERIOD_AHB  = 20.0;  // 50 MHz AHB clock
+parameter real CLK_PERIOD_PCLK  = 10.0;  // 100 MHz APB clock
+parameter real CLK_PERIOD_SPI   = 40.0;  // derived from CLK_DIV default
 ```
 
 ### 3. Generate uvm_config_db Initialization
@@ -1113,6 +2270,41 @@ endfunction
 ## Output
 Generate complete initialization file: `tb/tb_init_pkg.sv` with all parameters, `uvm_config_db` setup, and clocking block definitions.
 ```
+
+### Elaborated: Full `tb_init_pkg` and Config Checklist
+
+```systemverilog
+// tb/tb_init_pkg.sv — package for shared TB parameters
+package tb_init_pkg;
+  // From APB_SPI_Master_Spec_v1.2 §2.1
+  parameter int APB_DATA_WIDTH = 32;
+  parameter int APB_ADDR_WIDTH = 32;
+  parameter real APB_CLK_NS    = 20.0;   // 50 MHz
+  parameter int APB_RESET_CYCLES = 5;
+
+  // SPI parameters §5.x
+  parameter int SPI_MAX_BYTES = 64;      // per XFER_LEN spec
+  parameter int SPI_DEFAULT_CLK_DIV = 8;
+endpackage
+```
+
+**`uvm_config_db` checklist (must all be set before `run_test()`):**
+
+| Key | Type | Path | Set In |
+|-----|------|------|--------|
+| `vif` | `virtual apb_if` | `uvm_test_top.env.apb_agent.*` | `tb_top` initial |
+| `reg_model` | `apb_spi_reg_block` | `uvm_test_top` | test `build_phase` |
+| `data_width` | `int` | `uvm_test_top.*` | `tb_top` or env |
+| `max_xfer_len` | `int` | `uvm_test_top.env.*` | test or env |
+
+**Common initialization bugs:**
+
+| Bug | Symptom | Fix |
+|-----|---------|-----|
+| `vif` not set | `uvm_fatal` "virtual interface not found" | Set in `tb_top` before `run_test()` |
+| `reg_model` not reset | First test sees wrong reset values | Call `reg_model.reset()` in env `build_phase` |
+| Wrong path string | Agent finds no `vif` | Path must match hierarchy: `uvm_test_top.env.apb_agent.driver` |
+| Clocking block not used | Race on APB signals | Driver uses `vif.drv_cb`, monitor uses `vif.mon_cb` |
 
 ---
 
@@ -1660,6 +2852,56 @@ description: |
 ---
 ```
 
+### Elaborated: TbReviewer Sample Review
+
+**File under review:** `tb/scoreboard/spi_scoreboard.sv`
+
+```
+## TB Code Review: spi_scoreboard.sv
+
+### Summary
+Component type: scoreboard
+Overall: ⚠️ Warnings
+
+### ❌ Errors (Will Cause Simulation Failure)
+
+1. **Null pointer on reg_model** — Line 47
+   - Problem: `reg_model` used in `write()` but never assigned from `uvm_config_db`
+   - Fix: In `build_phase`: `void'(uvm_config_db#(apb_spi_reg_block)::get(this, "", "reg_model", reg_model));`
+
+### ⚠️ Warnings (Methodology Violations)
+
+1. **Using `$display` for debug** — Line 62
+   - Problem: `$display("compare fail addr=%h", tr.addr);`
+   - Fix: `` `uvm_error("SCB", $sformatf("compare fail addr=0x%0h", tr.addr)) ``
+
+2. **SLVERR not handled** — Line 55-70
+   - Problem: Scoreboard compares data even when `tr.slverr==1`
+   - Fix: Early return when `tr.slverr` (see §0.5 scoreboard snippet)
+
+### 💡 Suggestions (Coverage / Style)
+
+1. Add covergroup sample on successful compare — ties to `spi_xfer_cg.cp_mode`
+2. Consider out-of-order APB if DUT pipelines responses (not in current spec)
+```
+
+### Elaborated: Debugger Agent — UVM_ERROR Trace
+
+**User:** "UVM_ERROR: [CSR_RST] CTRL.enable: reset mismatch exp=0x0 got=0x1"
+
+**Debugger process:**
+
+| Step | Evidence | Conclusion |
+|------|----------|------------|
+| 1 | Error from `csr_reset_test` line 38 | Reset check failed on CTRL.enable |
+| 2 | Backdoor read → got 1 | DUT or model reset is wrong |
+| 3 | Read `ctrl_reg.sv` line 24 | Model has `1'b1` reset |
+| 4 | Read spec §4.2 table | Spec says reset 0 |
+| 5 | RTL reset input | `preset_n` released — DUT should reset to 0 |
+| **Root cause** | Model bug | Fix `enable.configure(..., 1'b0, ...)` |
+
+**Not** a DUT bug in this case — verification model was wrong.
+
 ---
 
 ## Persona Patterns for Verification
@@ -1804,7 +3046,7 @@ User Input                                        → Agent Selected
 "the CTRL_REG reset value looks wrong"                   → CsrChecker
 "coverage is stuck at 73% on the APB covergroup"         → CoverageAnalyzer
 "review my APB scoreboard for correctness"               → TbReviewer
-"I think we're missing burst tests"                      → Critic
+"I think we're missing SPI mode 2/3 tests"               → Critic
 "UVM_ERROR from status check in csr_rw_test"             → Debugger
 "write a directed sequence to hit the SLVERR bin"        → TestGenerator
 ```
@@ -2008,6 +3250,68 @@ scenarios:
     expected_not_contains:
       - "CRITICAL"
       - "mismatch"
+
+  - name: "w1c_field_check"
+    input: |
+      Spec: INT_STAT.done is W1C.
+      Model: done.configure(..., "W1C", ...)
+      Does the model match?
+    expected_contains:
+      - "W1C"
+      - "PASS"
+      - "INT_STAT"
+    expected_not_contains:
+      - "mismatch"
+      - "CRITICAL"
+```
+
+### Golden Test: SpecReader Agent
+
+```yaml
+# .cursor/tests/spec-reader.golden.yaml
+artifact: .cursor/agents/spec-reader.md
+scenarios:
+  - name: "shall_requirement"
+    input: |
+      Spec text: "When XFER_LEN.byte_count is zero the SPI master
+      shall not toggle SCLK and shall assert STATUS.mode_fault."
+    expected_contains:
+      - "shall not toggle SCLK"
+      - "mode_fault"
+      - "spi_zero_len"
+      - "HIGH"
+      - "REQ-"
+    expected_not_contains:
+      - "paraphrase only"
+      - "maybe"
+
+  - name: "ambiguous_spec"
+    input: |
+      Spec: "Software may clear the interrupt by writing to INT_STAT."
+      (Does not say W1C vs write-0)
+    expected_contains:
+      - "ambiguous"
+      - "clarification"
+      - "Open Questions"
+```
+
+### Golden Test: var-initialization Skill
+
+```yaml
+artifact: .cursor/skills/var-initialization/SKILL.md
+scenarios:
+  - name: "apb_vif_setup"
+    input: |
+      Set up testbench for APB agent with apb_if on pclk/preset_n.
+      Hierarchy: uvm_test_top.env.apb_agent
+    expected_contains:
+      - "uvm_config_db"
+      - "virtual apb_if"
+      - "apb_agent"
+      - "clocking"
+      - "drv_cb"
+    expected_not_contains:
+      - "force dut"
 ```
 
 ### Golden Test: Coverage Closure Skill
@@ -2244,6 +3548,87 @@ MetaAnalyzer examines the session and produces:
 | `planning` | spec-extraction, testplan-generation, risk-assessment |
 | `setup` | var-initialization, tb-config, reg-model-init |
 | `workflow` | run-regression, coverage-merge, waveform-analysis |
+
+---
+
+## Appendix B: Artifact Quick-Start Templates
+
+Copy these into `.cursor/` to bootstrap a verification project.
+
+### Minimal Rule — `rules/uvm-core/RULE.md`
+
+```yaml
+---
+description: "Core UVM verification standards for all SystemVerilog testbench files"
+globs: ["tb/**/*.sv", "tb/**/*.svh"]
+alwaysApply: false
+---
+- Use `uvm_info`/`uvm_error` — never `$display` in UVM components
+- Monitors are passive — never assign to interface signals in monitor
+- Call `super.build_phase(phase)` (and all phases) in every override
+- Check `uvm_status_e` after every `uvm_reg` read/write
+```
+
+### Minimal Command — `commands/run-sim.md`
+
+```markdown
+# /run-sim - Run UVM Test
+
+## Instructions
+When invoked: run `make sim TEST=${UVM_TESTNAME:-base_test} SEED=${SEED:-1} COV=1`.
+Report UVM_ERROR/UVM_FATAL counts and functional coverage %.
+On compile error: stop and show first 20 lines of log.
+```
+
+### Minimal Agent — `agents/csr-checker.md`
+
+```yaml
+---
+name: csr-checker
+readonly: true
+description: |
+  CSR register compliance auditor. Use for: verify registers, reset values,
+  field accessibility, reg model vs spec. Triggers: "CSR", "register map",
+  "reset value", "RO field", "W1C".
+---
+You compare uvm_reg models to specification tables field by field.
+Report: register, field, spec value, model value, severity, fix.
+Never edit RTL. Cite spec section for every finding.
+```
+
+### Minimal Skill — `skills/csr-verification/SKILL.md`
+
+```yaml
+---
+name: csr-verification
+description: |
+  Verify CSR registers against specification. Use when: verify registers,
+  check reset values, RO/W1C tests, register map compliance.
+  Triggers: "verify CSR", "register reset", "field accessibility".
+---
+## Process
+1. Parse spec register table
+2. Compare to uvm_reg model
+3. Run or generate csr_reset_test and csr_rw_test
+4. Report compliance table
+```
+
+---
+
+## Appendix C: Glossary (Verification)
+
+| Term | Meaning in this guide |
+|------|----------------------|
+| CSR | Control/Status Register — memory-mapped registers in DUT |
+| Reg model | `uvm_reg` hierarchy mirroring hardware register map |
+| Frontdoor | Register access through bus (APB) like software |
+| Backdoor | Direct peek/poke into reg model or HDL without bus cycles |
+| W1C | Write-1-to-clear field |
+| RSVD | Reserved — read 0, write ignored |
+| SLVERR | APB error response for failed transfer |
+| Covergroup | SystemVerilog functional coverage construct |
+| Directed test | Non-random sequence targeting specific bin/bug |
+| Persona lens | Same-context agent behavior (not isolated subagent) |
 
 ---
 
