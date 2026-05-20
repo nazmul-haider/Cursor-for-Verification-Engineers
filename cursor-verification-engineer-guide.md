@@ -1,8 +1,3 @@
----
-description: Cursor guide for verification engineers — Rules, Commands, Skills, Agents, MCP, Hooks, IDE modes, and APB SPI worked examples (SystemVerilog/UVM, CSR, coverage).
-alwaysApply: false
----
-
 # Cursor for Verification Engineers
 
 > A single reference for **SystemVerilog/UVM** teams: what goes where (Rules, Commands, Skills, Agents, MCP, Hooks, Prompts), how Cursor **modes** work, and hands-on examples on an **APB SPI master** testbench.
