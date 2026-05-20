@@ -1,78 +1,141 @@
 ---
-description: Cursor reference guide for hardware verification engineers — Rules, Commands, Skills, Agents tailored to spec reading, testbench code, variable initialization, and CSR verification.
+description: Cursor guide for verification engineers — Rules, Commands, Skills, Agents, MCP, Hooks, IDE modes, and APB SPI worked examples (SystemVerilog/UVM, CSR, coverage).
 alwaysApply: false
 ---
 
 # Cursor for Verification Engineers
 
-> All examples are drawn from hardware verification workflows: SystemVerilog/UVM testbenches, specification reading, CSR verification, coverage closure, and simulation automation.
+> A single reference for **SystemVerilog/UVM** teams: what goes where (Rules, Commands, Skills, Agents, MCP, Hooks, Prompts), how Cursor **modes** work, and hands-on examples on an **APB SPI master** testbench.
+
+**Read order:** **Concept-first** — Part 1 → 2 → 3–9 → 10 → 11–13. **Example-first** — Part 1 → 2 → **10** (early in file) → 3–9 → 11–13.
 
 ---
 
-## The Mental Model (Verification Context)
+## Table of Contents
 
-> **Rules guide. Skills do. Commands trigger. Agents specialize.**
-
-In verification terms:
-- **Rules** → your team's coding standards, naming conventions, and methodology guidelines — always active in the background
-- **Skills** → verification procedures you activate: "run CSR compliance check," "extract test plan from spec," "generate UVM sequence"
-- **Commands** → repeatable simulation workflows you trigger with a slash: `/run-sim`, `/check-coverage`, `/tb-checkpoint`
-- **Agents** → specialist personas: SpecReader, CsrChecker, CoverageAnalyzer, TbReviewer
+| Part | Topic | You will learn |
+|------|--------|----------------|
+| **1** | [Start Here — Mental Model](#part-1-start-here--mental-model) | What each artifact does; MCP as data layer; decision guide |
+| **2** | [Cursor IDE Modes](#part-2-cursor-ide-modes) | Agent, Ask, Plan, Debug — when to use each |
+| **3** | [Rules](#part-3-rules) | UVM standards, CSR policy, `alwaysApply` tax, rule authoring |
+| **4** | [Commands](#part-4-commands) | `/run-sim`, `/check-coverage`, MCP-powered workflows |
+| **5** | [Skills](#part-5-skills) | CSR verification, spec extraction, coverage closure |
+| **6** | [MCP for Verification](#part-6-mcp-for-verification) | Live regression, coverage, spec — not stale rules |
+| **7** | [Agents](#part-7-agents-subagents) | SpecReader, CsrChecker, TbReviewer, subagents |
+| **8** | [Hooks](#part-8-hooks-for-verification) | Gate sim commands, lint after `.sv` edits |
+| **9** | [Prompts vs Tools](#part-9-prompts-vs-tools) | When slash prompts differ from agent-invoked tools |
+| **10** | [Worked Examples](#part-10-elaborated-worked-examples) | Full `apb_spi_master` TB walkthrough |
+| **11** | [Smart Routing](#part-11-smart-routing-for-verification) | Auto-spawn the right verification agent |
+| **12** | [Testing Artifacts](#part-12-testing-verification-artifacts) | Golden tests for rules, agents, skills |
+| **13** | [Meta-Learning](#part-13-meta-learning-for-verification) | Turn repeated sim steps into commands |
+| **App** | [Appendix](#appendix-quick-reference) | Comparison tables, templates, glossary |
 
 ---
 
-## The Four Artifact Types
+# Part 1: Start Here — Mental Model
 
-| Type | Purpose | Invocation | When to Use |
-|------|---------|------------|-------------|
-| **Rules** | Persistent context and guardrails | Automatic or @mention | UVM coding standards, naming conventions, methodology policies |
-| **Commands** | User-triggered workflows | `/command` — manual only | Run simulation, check coverage, commit waveform snapshot |
-| **Skills** | Portable knowledge modules | Agent decides OR `/skill-name` | CSR verification, spec parsing, coverage closure workflows |
-| **Agents** | Specialized AI personas | Spawned by main agent | Deep spec analysis, scoreboard review, CSR compliance audit |
+> **Rules guide. Skills do. Commands trigger. Agents specialize. MCP supplies facts. Hooks enforce gates.**
 
-### Activation Matrix
+If you have customized Cursor and wondered *why isn't this working?* — you are not alone. The platform adds features faster than any one doc. This section is the map.
 
-Commands are the only artifact type that is **always manual** — the agent will never call them automatically.
-
-|  | User invokes | Agent decides | Always on | File/folder match |
-|--|:---:|:---:|:---:|:---:|
-| **Rules** | Yes | Yes | Yes | Yes |
-| **Skills** | Yes | Yes | No | No |
-| **Commands** | Yes | **No** | **No** | **No** |
-
-### The Problem: Everything in Rules
-
-Most verification teams start with rules and put everything there:
-
-- UVM naming conventions → Rule ✓
-- Simulation run workflow → Rule (awkward)
-- CSR compliance verification procedure → Rule (wrong tool)
-- Reusable coverage closure knowledge → Rule (won't scale)
-
-The fix: Use the right artifact for the job.
-
-### Decision Flowchart
+## The Stack (Verification View)
 
 ```mermaid
 flowchart TB
-  Q{"What do you need?"}:::primary
-  Q --> RULE["RULE\nstandards & policies"]:::accent
-  Q --> CMD["COMMAND\nsim workflow trigger"]:::accent
-  Q --> SKILL["SKILL\nverification procedure"]:::accent
-  Q --> AGENT["AGENT\nspec / coverage expert"]:::accent
+  subgraph assistant["AI ASSISTANT — reasoning & synthesis"]
+    MAIN[Main agent in chat]
+  end
+  subgraph policy["POLICY & PROCEDURE"]
+    RULES[RULES — how to write TB code]
+    CMD[COMMANDS — /run-sim workflows]
+    SKILL[SKILLS — CSR / coverage procedures]
+    AGENT[AGENTS — SpecReader, CsrChecker]
+  end
+  subgraph platform["PLATFORM / LIVE DATA"]
+    MCP[MCP — regression, cov, spec server]
+    SIM[Simulator / farm APIs]
+  end
+  MAIN --> RULES & CMD & SKILL & AGENT
+  RULES & CMD & SKILL & AGENT --> MCP
+  MCP --> SIM
 ```
+
+**Principle:** Each thing has one job. **MCP is the shared data layer** for anything that changes (regression status, coverage %, spec revisions, wave logs). **Stop putting that data in rules.**
+
+| Layer | Verification role | Example |
+|-------|-------------------|---------|
+| **Rules** | Policy — how the agent must behave | "Monitors never drive `spi_if`" |
+| **Commands** | Repeatable workflows you trigger | `/run-sim --test spi_loopback_test` |
+| **Skills** | Portable verification procedures | CSR compare, spec → testplan |
+| **Agents** | Deep, isolated expertise | Fresh-context CsrChecker audit |
+| **MCP** | Current facts from your environment | `regression_status()`, `cov_holes(test)` |
+| **Hooks** | Deterministic gates on agent actions | Block `rm -rf`, require lint after edit |
+| **Prompts** | User-initiated slash templates (rare in TB work) | `/review-tb` you pick from menu |
+
+## "Where Does This Go?" — Decision Guide
+
+| You are encoding… | Where it belongs | Why (verification) |
+|-------------------|------------------|---------------------|
+| UVM naming, `_e` on enums | **Rule** | Static methodology |
+| "Never drive from monitor" | **Rule** | Safety policy |
+| "Always poll STATUS.busy before RX read" | **Rule** | Sequencing policy |
+| Multi-step sim + cov + report | **Command** | You trigger `/run-sim` manually |
+| CSR field-by-field audit | **Agent** or **Skill** | Deep focus; skill if reusable across blocks |
+| Register map from live spec DB | **MCP** | Spec rev 2.1 → 2.2 without editing rules |
+| Today's regression pass/fail | **MCP** | Stale if hardcoded in rules |
+| SPI mode sweep procedure | **Skill** | Same steps on I2C block next project |
+| Block sim farm or Jenkins | **MCP** | Environment-specific |
+| Cross-project UVM patterns | **Skill** (global `~/.cursor/skills/`) | Portable |
+| Gate `make clean` on shared disk | **Hook** | Must be deterministic |
+| "Review my scoreboard" one-off | **Chat** or **Agent** | Ad hoc analysis |
+
+**Rule of thumb:** If it **could become stale** (test list, cov %, spec offset, tool versions), it belongs in **MCP**. If it is a **procedure**, it is a **command** or **skill**. If it needs **deep focus without your wrong hypothesis**, spawn an **agent**.
+
+## Artifact Types — Full Comparison
+
+| Type | Purpose | Who invokes | When (TB context) |
+|------|---------|-------------|-------------------|
+| **Rules** | Persistent guardrails | Auto, glob, or `@rule` | UVM style, CSR access, routing |
+| **Commands** | Saved workflows | **User only** (`/run-sim`) | Sim, cov merge, TB checkpoint |
+| **Skills** | Portable procedures | Agent or user | CSR verify, spec extract, cov closure |
+| **Agents** | Specialist personas | Main agent spawns | SpecReader, Debugger, TbReviewer |
+| **MCP** | Live data & actions | Model calls tools | Regression, cov DB, spec sections |
+| **Hooks** | Event scripts | Cursor on events | Approve sim, lint `.sv` after edit |
+| **Prompts** | Slash templates | **User** selects | Optional; most TB work is natural language |
+
+### Activation Matrix
+
+|  | User invokes | Agent decides | Always on | Glob / path |
+|--|:---:|:---:|:---:|:---:|
+| **Rules** | Yes | Yes | Optional | Yes |
+| **Skills** | Yes | Yes | No | No |
+| **Commands** | Yes | **No** | **No** | **No** |
+| **Agents** | Via routing | Yes | No | No |
+| **MCP tools** | Via agent | Yes | N/A | N/A |
+| **Hooks** | Automatic | N/A | On event | Matcher |
+
+### The Problem: Everything in Rules
+
+Teams often stuff the kitchen sink into rules:
+
+- UVM naming → Rule ✓
+- Full regression test list → Rule ✗ (use MCP or `regression.list` via MCP)
+- "Last sim failed on byte_count=0" → Rule ✗ (use MCP log tool)
+- CSR verification procedure → Skill ✓
+- `/run-sim` steps → Command ✓
 
 ### Quick Reference
 
-| You want... | Use |
-|-------------|-----|
-| "Always use `_e` suffix for enum types" | Rule |
-| "Never drive interface signals from monitor" | Rule |
-| "Run simulation with coverage, then check holes" | Command |
-| "Generate test plan from this spec section" | Skill |
-| "Verify all CSR registers against spec" | Skill |
-| "Deep analysis of uncovered assertions" | Agent |
-| "Review my scoreboard for functional correctness" | Agent |
+| You want… | Use |
+|-----------|-----|
+| `_seq` / `_test` / `_cg` naming | Rule |
+| Never assign in `spi_monitor` | Rule |
+| Run sim + report UVM_ERROR count | Command |
+| Extract §5.4 SPI requirements to testplan | Skill |
+| Compare `apb_spi_reg_block` to spec PDF | Skill or CsrChecker agent |
+| Fresh audit with no prior chat bias | Agent (`readonly: true`) |
+| Current uncovered bins for `spi_xfer_cg` | MCP |
+| Block `vcs -R` without license check | Hook |
 
 ### Directory Structure
 
@@ -81,35 +144,301 @@ flowchart TB
 ├── rules/
 │   ├── uvm-coding-standard/RULE.md
 │   ├── csr-access-policy/RULE.md
-│   ├── naming-convention/RULE.md
-│   └── autonomous-workflows/RULE.md
+│   ├── agent-routing/RULE.md
+│   └── cursor-rule-authoring/RULE.md   # meta-rule while editing .cursor/
 ├── commands/
 │   ├── run-sim.md
 │   ├── check-coverage.md
-│   ├── tb-checkpoint.md
 │   └── generate-csr-test.md
 ├── agents/
 │   ├── spec-reader.md
 │   ├── csr-checker.md
-│   ├── coverage-analyzer.md
 │   └── tb-reviewer.md
-└── skills/
-    ├── csr-verification/
-    │   └── SKILL.md
-    ├── coverage-closure/
-    │   └── SKILL.md
-    └── spec-extraction/
-        └── SKILL.md
+├── skills/
+│   ├── csr-verification/SKILL.md
+│   └── spec-extraction/SKILL.md
+├── hooks.json                          # Part 8
+├── hooks/
+│   ├── block-destructive-sim.sh
+│   └── sv-lint-after-edit.sh
+└── tests/                              # golden tests — Part 12
 
-# Global skills (cross-project)
-~/.cursor/skills/
-├── uvm-patterns/SKILL.md
-└── protocol-verification/SKILL.md
+~/.cursor/skills/                       # cross-project
+└── uvm-patterns/SKILL.md
+
+# MCP servers (project or user config — outside .cursor/)
+# e.g. regression-farm, spec-server, cov-report
 ```
+
+## Rules + MCP: "What" vs "How"
+
+- **Rules** = how the AI should behave when writing or reviewing TB code.
+- **MCP** = what is true **right now** in your project (regression, coverage, spec revision).
+
+### Anti-pattern: Data in Rules
+
+```markdown
+# BAD — embedded in a rule; rots every sprint
+Available regression tests:
+- csr_reset_test
+- spi_loopback_test
+- spi_random_test
+Last known coverage: 87.3% on spi_xfer_cg
+```
+
+### Pattern: Rules Reference MCP
+
+```markdown
+# GOOD — in agent-routing or run-sim command
+When user asks about regression or coverage:
+1. Call `regression_list()` via MCP (or read MCP-backed manifest)
+2. Call `cov_summary(test)` for the named test
+3. Present results; never hardcode pass/fail or %
+```
+
+The rule defines **process**. MCP provides **facts**.
+
+| In Rules | In MCP |
+|----------|--------|
+| "Always check `uvm_status_e` after reg access" | Register map for spec v2.0 |
+| "Use MCP-first before claiming cov closed" | Merged `.ucdb` / `.vdb` holes |
+| "Spawn CsrChecker for CSR audits" | Latest sim log for `spi_loopback_test` |
+| SPI protocol policy (MSB-first) | Live Jenkins queue depth |
+
+## Commands + MCP: Stop Hardcoding Steps
+
+**Static command (works, but brittle):**
+
+```markdown
+# /run-sim
+1. `make compile`
+2. `make sim TEST=spi_loopback_test SEED=1`
+3. Report UVM_ERROR count
+```
+
+**Dynamic command (MCP-powered):**
+
+```markdown
+# /run-sim — Run UVM Test with Live Context
+
+When the user invokes `/run-sim`:
+
+1. **Resolve test**
+   - If `--test` given, use it; else call `regression_default_test()` via MCP
+2. **Pre-check**
+   - Call `compile_status()` — if stale, run compile
+   - Call `license_available(simulator)` — stop with clear message if not
+3. **Execute**
+   - Run sim with `COV=1`; stream log path from MCP or local `sim.log`
+4. **Report**
+   - Parse UVM_ERROR/FATAL; call `cov_summary(test)` for functional %
+5. **Suggest next**
+   - If holes remain, point to uncovered bins from MCP (not memory)
+```
+
+| Command (verification) | MCP integration |
+|------------------------|-----------------|
+| `/run-sim` | Default test, license, log path, cov % |
+| `/check-coverage` | Merge DBs, list holes, assertion fire count |
+| `/tb-checkpoint` | Dirty files, last sim status |
+| `/review` | Fetch `tb/**/*.sv`, compare to UVM rule + spec section |
+
+## Agents + MCP: Experts Need Context
+
+**Without MCP:**
+
+```yaml
+name: Debugger
+description: |
+  Debug UVM test failures. Check scoreboard and CSR programming order.
+  # No access to actual sim.log or waves
+```
+
+**With MCP:**
+
+```yaml
+name: Debugger
+description: |
+  ## Process
+  1. Call `sim_log(test, seed)` for the failing run
+  2. Call `cov_assertion_status(test)` — which SVA never fired
+  3. Call `spec_section("5.4")` for zero-length SPI rules
+  4. Correlate UVM_ERROR time with APB/SPI monitor transactions
+  5. Report: hypothesis, evidence (log lines), suggested sequence fix
+```
+
+| Agent | MCP tools (examples) |
+|-------|----------------------|
+| Debugger | `sim_log`, `wave_marker`, `last_csr_writes` |
+| CoverageAnalyzer | `cov_holes`, `assertion_fire_count` |
+| CsrChecker | `spec_register_table`, `reg_model_diff` |
+| TbReviewer | (files in repo; optional `lint_report`) |
+
+## Skills + MCP: Patterns Everywhere
+
+Skills define **how** to verify; MCP supplies **this block's** register map and coverage.
+
+```markdown
+# CSR Verification Skill — integration points
+
+Works with any MCP that provides:
+- `spec_registers(block)` — field table for §4.2
+- `reg_model_path(block)` — path to `uvm_reg` package
+- `run_test(name)` — fire `csr_reset_test` and return status
+```
+
+| Skill | MCP provides |
+|-------|----------------|
+| csr-verification | Spec table, sim result |
+| coverage-closure | Uncovered bins, exclusion list |
+| spec-extraction | Section text, revision ID |
+| var-initialization | Parameter defaults from spec server |
+
+## When It All Clicks — Verification Workflow
+
+```mermaid
+sequenceDiagram
+  participant U as Verification engineer
+  participant R as Routing rule
+  participant A as Agents
+  participant M as MCP
+  participant C as /run-sim command
+
+  U->>R: Close cov on SPI modes and run regression
+  R->>A: CoverageAnalyzer + TestGenerator
+  A->>M: cov_holes(spi_xfer_cg)
+  M-->>A: Missing cp_cpol=1 cp_cpha=1
+  A-->>U: Add spi_cpol_cpha_sweep_seq
+  U->>C: /run-sim --regress
+  C->>M: regression_list, license_check
+  C-->>U: 4/4 PASS, cov 96%
+```
+
+**Contributions:** Routing rule detected intent → Agents analyzed with MCP data → You approved sequences → Command orchestrated sim via MCP → Main agent synthesized the report.
+
+## "Why Isn't This Working?" — Debugging
+
+| Check | Ask the agent |
+|-------|----------------|
+| Rules in context? | "List rule documents in the `<rules>` block this turn, with paths." |
+| MCP available? | "What MCP tools do you have? List names and one-line purpose." |
+| Right agent? | "What pattern did you detect? Which agents did you consider?" |
+| Command steps? | "Walk through each step you took for `/run-sim`." |
+| Force a rule | "Read `.cursor/rules/uvm-coding-standard/RULE.md` and list MUST constraints." |
+
+**Priority (highest wins):** System → Developer rules (`.cursor/rules/`) → User chat → README/comments.
+
+| Symptom | Likely cause |
+|---------|----------------|
+| Rule ignored | Glob mismatch (`tb/**/*.sv` vs `testbench/`) |
+| Partial compliance | Higher-priority instruction overrides |
+| MCP tool not called | Rule never says "call MCP first" |
+| Hook blocked sim | `beforeShellExecution` denied `make sim` |
+
+## The Iron Rules (Composable Design)
+
+1. **One job per artifact** — Rules = policy; Commands = procedures; Agents = depth; Skills = portable patterns; MCP = data.
+2. **MCP is single source of truth** — Never duplicate regression lists or cov % in rules.
+3. **Composability** — Rules route → Agents use MCP → Commands orchestrate MCP → Skills pattern-match MCP data.
+4. **Graceful degradation** — Without MCP: commands prompt for log path; agents work from pasted `sim.log`; rules still enforce UVM style.
+
+## Sanity Checklists
+
+**Rules:** policy not data · references MCP for dynamic facts · routing patterns · narrow globs
+
+**Commands:** orchestrates MCP when available · clear output format · handles compile/sim failure
+
+**Agents:** MCP for logs/cov/spec · `readonly` for auditors · structured report · escalation when ambiguous spec
+
+**MCP tools:** names match natural language ("regression status" → `regression_status`) · ≤8 parameters per tool · no `mode=` mega-tools
+
+**Hooks:** narrow event · matchers tested · `failClosed` only when safety-critical
+
+## Why Cursor Rules Matter for Verification Teams
+
+One-off prompts are fine for exploration. On a shared TB repo you need **defaults**:
+
+- Consistent UVM structure across `apb_agent` and `spi_agent`
+- Same CSR access policy for every junior engineer's sequences
+- Predictable behavior on `tb/**/*.sv` — not "whatever this chat remembers"
+
+**Meta trick:** Add `.cursor/rules/cursor-rule-authoring/` with `globs: [".cursor/**"]` so editing rules stays consistent (kebab-case folders, `RULE.md`, frontmatter). See Part 3.
+
+## Start Small
+
+You do not need every artifact on day one:
+
+1. **Rules + MCP** — UVM rule + regression/cov MCP (or Makefile wrappers exposed as MCP)
+2. **Commands** — when you are tired of typing `make sim` flags
+3. **Agents** — when CSR or coverage reviews need fresh context
+4. **Skills** — when the same procedure moves to the next block
+5. **Hooks** — when sim farm or lint policy must be machine-enforced
 
 ---
 
-# Part 0: Elaborated Worked Examples
+# Part 2: Cursor IDE Modes
+
+Cursor exposes **modes** that change what the agent can do. Pick the mode for the task — not every debug session needs full write access.
+
+| Mode | Tools | Edits repo? | Best for verification |
+|------|-------|:-----------:|---------------------|
+| **Agent** | Full (read, write, shell, MCP, subagents) | Yes | Implement sequences, fix scoreboard, run `make sim` |
+| **Ask** | Read-only | No | "Explain this SVA," spec Q&A, review without risk |
+| **Plan** | Read + plan output | No* | Architect TB changes, cov closure strategy before coding |
+| **Debug** | Full + debug workflow | Yes | UVM_ERROR root-cause with log/wave evidence |
+
+\*Plan mode produces a plan for you to approve; implementation happens after you switch to Agent (or approve execution).
+
+```mermaid
+flowchart LR
+  Q[Question or bug?] --> Ask[Ask mode\nread-only explain]
+  Q --> Plan[Plan mode\ndesign TB change]
+  Q --> Agent[Agent mode\nimplement + sim]
+  Bug[Sim failure] --> Debug[Debug mode\ntrace with evidence]
+  Plan --> Agent
+  Debug --> Agent
+```
+
+### Agent mode (default for implementation)
+
+- Write `spi_cpol_cpha_sweep_seq.sv`, update `reg_model`, run compile/sim.
+- Spawn subagents (SpecReader, CsrChecker) per routing rules.
+- **Use when:** you want files changed and simulations run.
+
+### Ask mode
+
+- Read spec PDFs, RTL (if allowed), TB — **no edits**.
+- **Use when:** "What does §5.4 require for `byte_count=0`?" or "Is this scoreboard comparison order correct?"
+- Pair with `@spec/APB_SPI_Master_Spec_v2.0.pdf` or MCP `spec_section`.
+
+### Plan mode
+
+- Produces step-by-step TB plan: sequences, tests, cov bins, risks.
+- **Use when:** large closure effort ("hit all SPI modes + SLVERR + W1C") before touching code.
+- Output is a checklist; execute in Agent mode.
+
+### Debug mode
+
+- Optimized for **failure analysis**: reproduce → gather logs → hypothesize → fix.
+- **Use when:** `UVM_ERROR`, assertion failures, or "test passed yesterday."
+- Workflow: capture `sim.log` / MCP `sim_log` → line-number citations → minimal fix → re-run.
+
+### Mode vs artifacts
+
+| Need | Mode | Also use |
+|------|------|----------|
+| Enforce naming on every edit | Agent + **Rules** (glob) | — |
+| Run `/run-sim` | Agent or Debug | **Command** |
+| CSR audit without chat bias | Agent | **Agent** CsrChecker subagent |
+| Block risky shell | Any | **Hook** `beforeShellExecution` |
+
+**Accurate usage note:** Commands (`/run-sim`) are **user-triggered** in all modes — the model does not auto-run slash commands. Rules can apply in Ask mode but cannot edit files. MCP tools follow the same availability as the host mode (Ask may expose read-only MCP tools only, depending on your server).
+
+> **Reading paths:** **Concept-first** — Part 1 → 2 → 3–9 → 10 → 11–13. **Example-first** — Part 1 → 2 → **10** (below) → 3–9 → 11–13. Part 10 is placed early so you can study the `apb_spi_master` TB before diving into artifact details.
+
+---
+
+# Part 10: Elaborated Worked Examples (Hands-On)
 
 The examples below use one reference project — an **APB-attached SPI master (`apb_spi_master`)**. Software configures the block through **APB CSRs**; the DUT drives an **SPI bus** (`sclk`, `mosi`, `miso`, `cs_n`) to a loopback or SPI slave BFM. Every artifact type (rule, command, skill, agent) is shown against the same DUT.
 
@@ -174,7 +503,7 @@ apb_spi_verif/
 
 ---
 
-## 0.1 Reading the Specification (SpecReader)
+## 10.1 Reading the Specification (SpecReader)
 
 ### Spec Excerpt — APB Register Map (§4.2)
 
@@ -223,7 +552,7 @@ apb_spi_verif/
 
 ---
 
-## 0.2 Complete CSR Register Model
+## 10.2 Complete CSR Register Model
 
 Full `uvm_reg` block for the APB SPI master CSR map:
 
@@ -349,7 +678,7 @@ CsrChecker should flag all three with spec table row citations.
 
 ---
 
-## 0.3 Complete Testbench Initialization
+## 10.3 Complete Testbench Initialization
 
 ### APB Interface — CSR Port (`tb/interfaces/apb_if.sv`)
 
@@ -568,7 +897,7 @@ endclass
 
 ---
 
-## 0.4 Complete CSR Tests (Generated by `/generate-csr-test`)
+## 10.4 Complete CSR Tests (Generated by `/generate-csr-test`)
 
 ### Reset Value Test (`tb/tests/csr_reset_test.sv`)
 
@@ -685,7 +1014,7 @@ endtask
 
 ---
 
-## 0.5 Directed Sequence for Coverage Closure
+## 10.5 Directed Sequence for Coverage Closure
 
 ### APB Covergroup (`tb/coverage/apb_trans_cg.sv`)
 
@@ -790,7 +1119,7 @@ endclass
 
 ---
 
-## 0.6 Monitor vs Driver — Rule Enforcement Example
+## 10.6 Monitor vs Driver — Rule Enforcement Example
 
 ### APB: Passive Monitor
 
@@ -878,7 +1207,7 @@ end
 
 ---
 
-## 0.7 Command Session Transcripts (Expected Output)
+## 10.7 Command Session Transcripts (Expected Output)
 
 ### `/run-sim --test csr_reset_test --seed 42`
 
@@ -994,7 +1323,7 @@ CTRL.cpol, CTRL.clk_div, STATUS.tx_empty, TX_DATA map, RX_DATA map, INT_STAT
 
 ---
 
-## 0.8 End-to-End Day Flow (All Artifacts Together)
+## 10.8 End-to-End Day Flow (All Artifacts Together)
 
 ```mermaid
 flowchart TD
@@ -1024,7 +1353,7 @@ flowchart TD
 
 ---
 
-# Part 1: Rules
+# Part 3: Rules
 
 ## What Rules Are
 
@@ -1056,11 +1385,69 @@ Rules don't run simulations. They don't invoke tools. They sit in the background
 
 ### What Does NOT Belong in Rules
 
-- Multi-step simulation and coverage workflows (that's a skill)
-- One-off test generation you run occasionally (that's a command)
-- Detailed CSR verification procedures with reference register maps (that's a skill)
+- Full regression test lists (use `tests/regression.list` + MCP)
+- Last simulation pass/fail or coverage percentages
+- Register maps copied from spec (use MCP `spec_registers` or `@spec/`)
+- Step-by-step `make sim` invocations (use **Commands**)
+- Multi-page CSR audit procedures (use **Skills** or **Agents**)
+- Multi-step simulation and coverage workflows (use **Skills**)
+- One-off test generation you run occasionally (use **Commands**)
 
-> **Rule of thumb:** If it tells the agent *how to write* verification code, it's a rule. If it tells the agent *how to run* a verification procedure, it's a skill.
+> **Rule of thumb:** If it tells the agent *how to write* verification code, it's a rule. If it tells the agent *how to run* a procedure, it's a skill or command.
+
+### Cursor Rule Authoring Standard
+
+Use a **meta-rule** while editing `.cursor/` — `.cursor/rules/cursor-rule-authoring/RULE.md` with `globs: [".cursor/**"]`.
+
+| Requirement | Detail |
+|-------------|--------|
+| **Location** | `.cursor/rules/<kebab-name>/RULE.md` |
+| **Folder name** | Kebab-case, one purpose — `uvm-coding-standard`, not `Rules1` |
+| **Frontmatter** | `description`, `globs`, `alwaysApply` |
+| **Content** | Actionable MUST/SHOULD; examples for procedural rules |
+| **Scope** | Prefer narrow globs: `tb/**/*.sv`, `tb/reg_model/**` |
+
+**Application modes:**
+
+| Mode | When | Frontmatter |
+|------|------|-------------|
+| Always Apply | Universal UVM safety (rare) | `alwaysApply: true` |
+| Glob (recommended) | TB vs RTL vs docs | `alwaysApply: false` + `globs` |
+| Intelligent | Hard to glob ("CSR work") | Strong `description` |
+| Manual | Rare workflows | `@rule-name` in chat |
+
+**New rule template:**
+
+```yaml
+---
+description: "One sentence: what it enforces and when"
+globs:
+  - "tb/**/*.sv"
+alwaysApply: false
+---
+
+# <Rule Title>
+## Intent
+## Scope
+## Rules (MUST / SHOULD)
+## Example
+```
+
+**Validation before commit:** kebab folder · `RULE.md` exists · description specific · globs not `**/*` unless intentional · no duplicate policy in two rules.
+
+**Debugging rule application:**
+
+```
+"List rule documents in the <rules> block this turn, with paths."
+"Quote the rule text you follow for monitor driving, with file path."
+"Read .cursor/rules/csr-access-policy/RULE.md and summarize MUST items."
+```
+
+| Symptom | Likely cause |
+|---------|----------------|
+| Ignored | Glob mismatch (`testbench/` vs `tb/`) |
+| Partial | Higher-priority instruction overrides |
+| Inconsistent | `alwaysApply` too broad — use 2+2 test (below) |
 
 ### Example Rule: UVM Coding Standard
 
@@ -1268,7 +1655,7 @@ grep -l "alwaysApply: true" .cursor/rules/**/*.md | xargs wc -l
 
 ---
 
-# Part 2: Commands
+# Part 4: Commands
 
 ## What Commands Are
 
@@ -1614,7 +2001,7 @@ Generate tests for a single field only.
 
 After `/generate-csr-test --reg ctrl_reg_block`, the agent produces:
 
-**File: `tb/tests/csr_reset_test.sv`** — see §0.4 above.
+**File: `tb/tests/csr_reset_test.sv`** — see §10.4 above.
 
 **File: `tb/sequences/csr_rw_walking_seq.sv`** (walking-ones for RW fields):
 
@@ -1819,7 +2206,7 @@ flowchart TD
 
 ---
 
-# Part 3: Skills
+# Part 5: Skills
 
 ## Rules vs Skills for Verification
 
@@ -1997,7 +2384,7 @@ Verify all registers in a register block against the specification-defined:
 | 3 | Cross-check | 2 mismatches: CTRL.enable reset, STATUS.busy access |
 | 4 | Generate tests | `csr_reset_test.sv`, `csr_rw_test.sv` already exist — offer update |
 | 5 | Run `/run-sim --test csr_reset_test` | 1 UVM_ERROR — confirms finding |
-| 6 | Report | CSR Compliance Report (see §0.7 CsrChecker sample) |
+| 6 | Report | CSR Compliance Report (see §10.7 CsrChecker sample) |
 
 **Walking-ones result table (excerpt):**
 
@@ -2080,7 +2467,7 @@ For each reachable hole:
 **CoverageAnalyzer reasoning:**
 
 1. **Bin `cp_rsp.slverr`** — Reachable. Spec §3.6 requires SLVERR on illegal address. No exclusion.
-2. **Action** — Write `apb_slverr_inj_seq` (see §0.5).
+2. **Action** — Write `apb_slverr_inj_seq` (see §10.5).
 3. **Re-run** — `/run-sim --test apb_sanity_test --seed 99` with sequence added to base test.
 4. **Result** — `cp_rsp.slverr` → 100%, `cx_wr_slverr` → 100%, overall `apb_trans_cg` → 91%.
 
@@ -2406,7 +2793,131 @@ Main `SKILL.md`: the procedure (under 150 lines).
 
 ---
 
-# Part 4: Agents (Subagents)
+# Part 6: MCP for Verification
+
+MCP (Model Context Protocol) connects Cursor to **live** verification infrastructure: regression farms, coverage databases, spec servers, wave viewers. Tool names below are **patterns** — your server may expose `jenkins_regression`, `vcover_holes`, or internal APIs.
+
+## Why MCP Exists for TB Teams
+
+| Without MCP | With MCP |
+|-------------|----------|
+| Paste `sim.log` every debug session | `sim_log(test, seed)` |
+| Copy register table from PDF into chat | `spec_registers("apb_spi_master")` |
+| Guess which tests are in nightly | `regression_list()` |
+| Stale cov % in a rule file | `cov_summary(test)` on every `/check-coverage` |
+
+**Design principle:** Users speak natural language ("why did loopback fail?"); the LLM selects tools. **Design tools for the LLM**, not for human browsing.
+
+## MCP Mental Model
+
+```mermaid
+flowchart LR
+  U[Engineer] --> LLM[Cursor agent]
+  LLM --> T1[regression_status]
+  LLM --> T2[cov_holes]
+  LLM --> T3[spec_section]
+  T1 & T2 & T3 --> S[MCP server]
+  S --> Farm[CI / simulator]
+  S --> SpecDB[Spec / reg map]
+```
+
+## Example Verification MCP Tools
+
+Design **one operation per tool**, ≤8 parameters, names matching intent:
+
+| User says | Tool name | Returns |
+|-----------|-----------|---------|
+| "What's in regression?" | `regression_list` | Test names, seeds, cov on/off |
+| "Did loopback pass?" | `regression_status` | PASS/FAIL, log path, UVM counts |
+| "Show cov holes" | `cov_holes` | Uncovered bins, assertions not fired |
+| "Get §4.2 register map" | `spec_registers` | Offset, field, access, reset |
+| "Last CSR writes before error" | `apb_trace` | Address, data, cycle time |
+
+### Anti-pattern: Mode-Based Mega-Tool
+
+```json
+// BAD — 30 parameters, mode enum
+{ "name": "verification", "properties": { "mode": ["list","sim","cov","spec"], ... } }
+```
+
+### Pattern: Focused Tools
+
+```json
+// GOOD
+regression_list()
+regression_run(test, seed)
+cov_holes(test, covergroup)
+spec_section(block, section_id)
+```
+
+## MCP Tool Design — Five Principles (Verification)
+
+1. **One operation, one tool** — `cov_holes`, not `coverage(mode=holes)`.
+2. **Names match natural language** — `spi_mode_fault_check` not `smf_chk`.
+3. **Flags for common combos** — `regression_run(test, cov=1, compile=1)`.
+4. **Hierarchy in names** — `spec_registers`, `spec_spi_timing`, `spec_revision`.
+5. **Snake_case only** — dots break some API bridges (`persona.data` → use `persona_data`).
+
+### Red Flags
+
+- Tool has >10 parameters
+- Description says "use mode=X for…"
+- User must know internal project codenames
+- Return value is unstructured prose (prefer JSON tables)
+
+## Wiring MCP into Artifacts
+
+| Artifact | MCP role |
+|----------|----------|
+| **Rule** | "Before claiming closure, call `cov_holes`" — not the hole list itself |
+| **Command** | `/run-sim` calls `license_check`, `regression_run`, `cov_summary` |
+| **Skill** | CSR skill calls `spec_registers` then compares to `uvm_reg` file |
+| **Agent** | Debugger calls `sim_log` + `apb_trace` first |
+| **Hook** | `beforeMCPExecution` — approve `regression_run` on production farm |
+
+## Example: Spec Server MCP
+
+```markdown
+## Tool: spec_registers
+Input: block_name (e.g. "apb_spi_master"), section (e.g. "4.2")
+Output: Markdown table — Offset, Register, Field, Bits, Access, Reset
+
+## Tool: spec_revision
+Output: "APB_SPI_Master_Spec_v2.0.pdf rev C — 2025-03-01"
+```
+
+Rules say: *compare model to spec via MCP table, cite revision in report.*
+
+## Example: Regression / Coverage MCP
+
+```markdown
+## Tool: regression_list
+Output: [{ "test": "spi_loopback_test", "seed": "random", "cov": true }, ...]
+
+## Tool: cov_holes
+Input: test, optional covergroup ("spi_xfer_cg")
+Output: [{ "bin": "cp_cpol_1_cp_cpha_1", "hits": 0 }, ...]
+```
+
+## Graceful Degradation
+
+If MCP is down:
+
+- Commands fall back to local `make sim` and `sim.log` in repo
+- Agents ask you to paste failing log excerpt
+- Rules still enforce UVM style
+
+## MCP Checklist
+
+- [ ] Tools return **current** state (not cached yesterday)
+- [ ] Names align with engineer vocabulary (CSR, UVM, APB, SPI)
+- [ ] Structured output (tables, JSON)
+- [ ] Descriptions say **when** to pick this tool vs a similar one
+- [ ] No duplicate data copied into `.cursor/rules/`
+
+---
+
+# Part 7: Agents (Subagents)
 
 ## What Agents Are for Verification
 
@@ -2877,7 +3388,7 @@ Overall: ⚠️ Warnings
 
 2. **SLVERR not handled** — Line 55-70
    - Problem: Scoreboard compares data even when `tr.slverr==1`
-   - Fix: Early return when `tr.slverr` (see §0.5 scoreboard snippet)
+   - Fix: Early return when `tr.slverr` (see §10.5 scoreboard snippet)
 
 ### 💡 Suggestions (Coverage / Style)
 
@@ -2981,7 +3492,142 @@ Fix: Explicitly add `- Never modify RTL source — CsrChecker is read-only`
 
 ---
 
-# Part 5: Smart Routing for Verification
+# Part 8: Hooks for Verification
+
+Hooks run **deterministic** scripts or prompt checks on Cursor events. Use them when policy must be enforced (sim farm safety, lint, secrets) — not when guidance in a rule is enough.
+
+## Hooks vs Rules vs MCP
+
+| Mechanism | Enforces | Example |
+|-----------|----------|---------|
+| **Rule** | Soft — model should comply | "Never `rm -rf` in project root" |
+| **Hook** | Hard — can block shell/MCP | Deny `rm -rf`, ask on `vcs` without `LM_LICENSE_FILE` |
+| **MCP** | Data + actions | `regression_run` on farm |
+
+## Location
+
+| Scope | Config | Scripts |
+|-------|--------|---------|
+| Project (share with team) | `.cursor/hooks.json` | `.cursor/hooks/*.sh` |
+| User (personal machine) | `~/.cursor/hooks.json` | `~/.cursor/hooks/*.sh` |
+
+Project hooks run from **repo root** — use `.cursor/hooks/script.sh`.
+
+## Common Events (Verification)
+
+| Event | Use |
+|-------|-----|
+| `beforeShellExecution` | Gate `make sim`, `vcs`, `xrun`, destructive `rm` |
+| `afterShellExecution` | Audit sim exit code, log size |
+| `beforeMCPExecution` | Approve farm `regression_run` |
+| `afterFileEdit` | Run `verilator --lint-only` on changed `.sv` |
+| `preToolUse` / `postToolUse` | Filter specific tool types |
+| `subagentStart` | Restrict `shell` subagent on signoff branches |
+| `beforeSubmitPrompt` | Block API keys / license keys in prompt |
+| `stop` | Post-run reminder ("update regression.list if new test") |
+
+## Example: Block Destructive Sim Commands
+
+`.cursor/hooks.json`:
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": ".cursor/hooks/block-destructive-sim.sh",
+        "matcher": "rm -rf|make clean",
+        "failClosed": true
+      }
+    ]
+  }
+}
+```
+
+`.cursor/hooks/block-destructive-sim.sh`:
+
+```bash
+#!/bin/bash
+input=$(cat)
+command=$(echo "$input" | jq -r '.command // empty')
+if [[ "$command" =~ rm\ -rf|make\ clean ]]; then
+  echo '{"permission":"deny","user_message":"Blocked: destructive clean on shared sim workspace. Use local build dir."}'
+  exit 0
+fi
+echo '{"permission":"allow"}'
+```
+
+Make the script executable (`chmod +x`).
+
+## Example: Lint After TB Edit
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "afterFileEdit": [
+      {
+        "command": ".cursor/hooks/sv-lint-after-edit.sh",
+        "matcher": "Write"
+      }
+    ]
+  }
+}
+```
+
+Script runs project `svlint` or `verilator --lint-only` on the edited path; returns `additional_context` with warnings for the agent.
+
+## Matchers
+
+- JavaScript regex (not POSIX) — e.g. `make sim|vcs -R`
+- Start simple; tighten after the hook fires reliably
+- `beforeSubmitPrompt` matches `UserPromptSubmit`
+
+## Hook Outputs (by event)
+
+| Event | Can return |
+|-------|------------|
+| `beforeShellExecution` | `permission` (allow/deny/ask), `user_message` |
+| `preToolUse` | `permission`, `updated_input` |
+| `postToolUse` | `additional_context` |
+| `subagentStart` | `permission` |
+| `subagentStop` | `followup_message` (chain workflows) |
+
+Exit code `2` blocks; non-zero otherwise fails open unless `failClosed: true`.
+
+## Verification Hook Checklist
+
+- [ ] Narrow matcher (not every shell command)
+- [ ] Script dependencies (`jq`, simulator) exist on CI machines
+- [ ] Team agrees on deny vs ask
+- [ ] Documented in README for sim farm users
+
+---
+
+# Part 9: Prompts vs Tools
+
+MCP defines two mechanisms:
+
+| Mechanism | Who triggers | TB usage |
+|-----------|--------------|----------|
+| **Tools** | Model (automatic) | `cov_holes`, `spec_registers`, `regression_run` |
+| **Prompts** | User (slash / menu) | `/formal-review` template you explicitly pick |
+
+**Reality:** Verification engineers usually type natural language ("run loopback with seed 7"). The LLM invokes **tools**, not slash prompts. Invest in **MCP tools** and **Commands** (`/run-sim`); treat MCP prompts as optional shortcuts.
+
+| Need | Use |
+|------|-----|
+| Repeatable sim workflow | **Command** `/run-sim` |
+| Live regression status | **MCP tool** |
+| Optional fixed review checklist | **MCP prompt** or **Command** |
+| Portable CSR procedure | **Skill** |
+
+**Prompts ≠ Rules:** Rules inject every matching session; prompts load only when you invoke them.
+
+---
+
+# Part 11: Smart Routing for Verification
 
 ## The Routing Rule
 
@@ -3133,7 +3779,7 @@ Phrase                                    → Implied Agent/Command
 
 ---
 
-# Part 6: Testing Verification Artifacts
+# Part 12: Testing Verification Artifacts
 
 ## The Artifact Testing Pyramid
 
@@ -3372,7 +4018,7 @@ scenarios:
 
 ---
 
-# Part 7: Meta-Learning for Verification
+# Part 13: Meta-Learning for Verification
 
 ## The Learning Loop
 
@@ -3511,27 +4157,28 @@ MetaAnalyzer examines the session and produces:
 
 ## Full Comparison Table
 
-| | Rules | Skills | Commands | Agents |
-|--|-------|--------|---------|-------|
-| **What it is** | Passive guidance | Active verification procedure | Saved simulation workflow | Specialized verification persona |
-| **Purpose** | TB coding standards, access policies | CSR verification, coverage closure, spec extraction | `/run-sim`, `/check-coverage`, `/tb-checkpoint` | SpecReader, CsrChecker, CoverageAnalyzer, TbReviewer |
-| **Activation** | Always on or glob-triggered | Agent decides or `/skill-name` | **User only — always manual** | Spawned by main agent |
-| **Context loading** | Loaded every matching conversation | Progressive — description first, full contents on demand | Injected when triggered | Fresh isolated context window |
-| **Best for** | Naming conventions, methodology enforcement | Multi-step verification procedures | Repeatable simulation tasks | Deep audits requiring fresh unbiased perspective |
-| **Think of it as** | Your methodology handbook | Your verification procedure library | Your simulation shortcuts | Your specialist colleagues |
+| | Rules | Skills | Commands | Agents | MCP | Hooks |
+|--|-------|--------|----------|--------|-----|-------|
+| **What it is** | Passive policy | Portable procedure | User workflow | Specialist persona | Live data/actions | Event gate |
+| **Purpose** | UVM style, CSR policy | CSR verify, cov closure | `/run-sim`, `/check-coverage` | SpecReader, CsrChecker | Regression, cov, spec | Block unsafe sim shell |
+| **Activation** | Auto / glob / `@` | Agent or user | **User only** | Spawned | Agent calls tools | On Cursor events |
+| **Stale data?** | Must not embed lists | Patterns OK | Steps OK | Expertise OK | **Source of truth** | N/A |
+| **Think of it as** | Methodology handbook | Procedure library | Sim shortcuts | Specialist colleague | Lab instruments | Safety interlock |
 
-## The Three Questions
+## The Five Questions
 
-1. **Does it tell the agent how to write verification code?** → Rule
-2. **Does it tell the agent how to run a verification procedure?** → Skill
-3. **Is it a simulation workflow you're tired of typing?** → Command
-4. **Does it require deep focused expertise or a fresh unbiased perspective?** → Agent
+1. **How to write TB code?** → Rule
+2. **How to run a verification procedure?** → Skill
+3. **Tired of typing the same sim workflow?** → Command
+4. **Need deep / fresh-context audit?** → Agent
+5. **Changes every run (cov %, regression, spec rev)?** → MCP (rules only *reference* MCP)
+6. **Must block or audit deterministically?** → Hook
 
 ## Key Verification Principles
 
 | Principle | Application |
 |-----------|------------|
-| Rules guide, Skills do, Commands trigger | Use rules for standards; skills for CSR/coverage workflows; commands for /run-sim |
+| Rules guide, Skills do, Commands trigger, MCP supplies facts | Standards in rules; live cov/regression in MCP; never hardcode test lists in rules |
 | The 2+2 test | If "what does this SV syntax mean?" doesn't need the CSR access rule, don't alwaysApply it |
 | Description is discovery | Skills are only as findable as their descriptions — include natural phrases like "what could go wrong" |
 | Monitors are passive | Never drive interface signals from a monitor — this is a rule, not a skill |
@@ -3629,7 +4276,13 @@ description: |
 | Covergroup | SystemVerilog functional coverage construct |
 | Directed test | Non-random sequence targeting specific bin/bug |
 | Persona lens | Same-context agent behavior (not isolated subagent) |
+| MCP | Model Context Protocol — tools for live regression, spec, coverage |
+| Hook | Script on Cursor events (`beforeShellExecution`, `afterFileEdit`, …) |
+| Agent mode | Full read/write/sim — default for TB implementation |
+| Ask mode | Read-only — spec/TB explanation without edits |
+| Plan mode | Design-first — testplan/cov strategy before coding |
+| Debug mode | Failure analysis with log/wave evidence |
 
 ---
 
-*Tailored for hardware verification engineers working with SystemVerilog/UVM testbenches, CSR register verification, specification reading, and coverage closure. Concepts sourced from agenticthinking.ai and adapted with verification-domain examples.*
+*Tailored for hardware verification engineers: SystemVerilog/UVM, CSR, spec reading, coverage closure, MCP integration, hooks, and Cursor IDE modes. Reference DUT: `apb_spi_master` (APB CSR + SPI). Concepts adapted from agenticthinking.ai and Cursor platform docs.*
